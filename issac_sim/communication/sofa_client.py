@@ -1,29 +1,62 @@
-import zmq
 import json
 import logging
+from typing import Any, Dict, Optional
+
+import zmq
+
+LOGGER = logging.getLogger(__name__)
 
 class SofaCableClient:
     """
     ZMQ REQ client for SOFA cable-driven soft body (RL Env Interface)
     """
-    def __init__(self, host="localhost", port=5555, timeout_ms=5000):
+    def __init__(self, host="localhost", port=5555, timeout_ms=5000, reconnect_attempts=1):
         self.context = zmq.Context()
-        self.sock = self.context.socket(zmq.REQ)
-        
-        # 设置超时防死锁
-        self.sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        self.sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        self.sock.connect(f"tcp://{host}:{port}")
+        self.sock = None
+        self.host = host
+        self.port = port
+        self.timeout_ms = timeout_ms
+        self.reconnect_attempts = max(0, int(reconnect_attempts))
+        self._connect()
 
-    def _send_and_recv(self, command_dict: dict):
+    def _connect(self):
+        if self.sock is not None:
+            self.sock.close()
+        self.sock = self.context.socket(zmq.REQ)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+        self.sock.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+        # 允许在超时后恢复 REQ socket 状态机，避免 send/recv 锁死
+        if hasattr(zmq, "REQ_RELAXED"):
+            self.sock.setsockopt(zmq.REQ_RELAXED, 1)
+        if hasattr(zmq, "REQ_CORRELATE"):
+            self.sock.setsockopt(zmq.REQ_CORRELATE, 1)
+        self.sock.connect(f"tcp://{self.host}:{self.port}")
+
+    def _reconnect(self):
+        LOGGER.warning("Reconnecting ZMQ socket to tcp://%s:%s", self.host, self.port)
+        self._connect()
+
+    def _send_and_recv(self, command_dict: dict) -> Optional[Dict[str, Any]]:
         """内部通信封装，处理序列化和异常"""
-        try:
-            self.sock.send_string(json.dumps(command_dict))
-            reply_str = self.sock.recv_string()
-            return json.loads(reply_str)
-        except zmq.error.Again:
-            logging.error("ZMQ Timeout: SOFA server is not responding! Did SOFA crash?")
-            return None 
+        attempts = self.reconnect_attempts + 1
+        for attempt_idx in range(attempts):
+            try:
+                self.sock.send_string(json.dumps(command_dict))
+                reply_str = self.sock.recv_string()
+                parsed_reply = json.loads(reply_str)
+                if not isinstance(parsed_reply, dict):
+                    LOGGER.error("Unexpected SOFA response type: %s", type(parsed_reply).__name__)
+                    return None
+                return parsed_reply
+            except zmq.error.Again:
+                LOGGER.error("ZMQ timeout waiting for SOFA response.")
+            except (json.JSONDecodeError, zmq.error.ZMQError) as exc:
+                LOGGER.error("ZMQ communication error: %s", exc)
+
+            if attempt_idx < attempts - 1:
+                self._reconnect()
+        return None
 
     def step(self, cable_disp: float):
         """
@@ -45,5 +78,7 @@ class SofaCableClient:
         return self._send_and_recv(cmd)
 
     def close(self):
-        self.sock.close()
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
         self.context.term()
