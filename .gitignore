@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Python cache artifacts
+**/__pycache__/
+
+# Training and runtime logs
+logs/
+*.log
+events.out.tfevents.*
+issac_sim/ppo_sofa_tensorboard/
+
+# SOFA simulation outputs
+sofa/vtk_output/
+**/vtk_output/
