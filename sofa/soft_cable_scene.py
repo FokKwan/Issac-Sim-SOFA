@@ -11,18 +11,29 @@ import meshio
 SofaRuntime.importPlugin("Sofa.Component")
 SofaRuntime.importPlugin("SoftRobots")
 
-YOUNG_MODULUS = 3000.0
-POISSON_RATIO = 0.45
+ROBOT_YOUNG_MODULUS = 3000.0
+ROBOT_POISSON_RATIO = 0.45
+TISSUE_YOUNG_MODULUS = 1200.0
+TISSUE_POISSON_RATIO = 0.46
+LESION_CONTACT_RADIUS = 0.03
 
 def createScene(root):
     """
-    构建软体机器人仿真场景
+    构建软体机器人+目标组织+病灶区域场景
     """
     root.dt = 0.01
     root.gravity = [0, -9.81, 0]
-    root.addObject("DefaultAnimationLoop")
+    root.addObject("FreeMotionAnimationLoop")
+    root.addObject("GenericConstraintSolver", maxIterations=300, tolerance=1.0e-6)
 
-    # 1. 物理模型节点
+    # 基础接触流水线，让软体机器人和组织在同一 SOFA 物理世界交互
+    root.addObject("CollisionPipeline")
+    root.addObject("BruteForceBroadPhase")
+    root.addObject("BVHNarrowPhase")
+    root.addObject("LocalMinDistance", alarmDistance=0.006, contactDistance=0.002, angleCone=0.0)
+    root.addObject("CollisionResponse", response="FrictionContactConstraint", responseParams="mu=0.2")
+
+    # 1) 连续体机器人节点
     soft = root.addChild("SoftBody")
     soft.addObject("EulerImplicitSolver")
     soft.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
@@ -41,11 +52,12 @@ def createScene(root):
         name="fem",
         topology="@grid",
         method="large",
-        youngModulus=YOUNG_MODULUS,
-        poissonRatio=POISSON_RATIO,
+        youngModulus=ROBOT_YOUNG_MODULUS,
+        poissonRatio=ROBOT_POISSON_RATIO,
     )
     
     soft.addObject("UniformMass", totalMass=0.5)
+    soft.addObject("PointCollisionModel", group=1)
 
     # 缆绳约束：索引需在网格点数范围内
     soft.addObject(
@@ -56,10 +68,42 @@ def createScene(root):
         valueType="displacement",
         pullPoint=[0, 0, -0.1]
     )
+
+    # 2) 目标组织节点（包含病灶区域）
+    tissue = root.addChild("TargetTissue")
+    tissue.addObject("EulerImplicitSolver")
+    tissue.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
+    tissue.addObject(
+        "RegularGridTopology",
+        name="grid",
+        min=[-0.03, -0.02, 0.72],
+        max=[0.13, 0.05, 0.94],
+        nx=8,
+        ny=5,
+        nz=6,
+    )
+    tissue.addObject("MechanicalObject", name="dofs", template="Vec3d")
+    tissue.addObject(
+        "HexahedronFEMForceField",
+        name="fem",
+        topology="@grid",
+        method="large",
+        youngModulus=TISSUE_YOUNG_MODULUS,
+        poissonRatio=TISSUE_POISSON_RATIO,
+    )
+    tissue.addObject("UniformMass", totalMass=0.8)
+    tissue.addObject(
+        "BoxROI",
+        name="fixed_roi",
+        box=[-0.04, -0.021, 0.70, 0.14, -0.013, 0.96],
+        drawBoxes=False,
+    )
+    tissue.addObject("FixedConstraint", indices="@fixed_roi.indices")
+    tissue.addObject("PointCollisionModel", group=2)
     return root
 
 
-def compute_mechanics_metrics(positions, rest_positions):
+def compute_mechanics_metrics(positions, rest_positions, young_modulus):
     if positions.size == 0 or rest_positions.size == 0:
         return 0.0, 0.0
 
@@ -71,8 +115,69 @@ def compute_mechanics_metrics(positions, rest_positions):
 
     avg_strain = float(np.mean(displacement_norm) / char_length)
     # 当前场景使用位移比例近似应力指标，避免奖励函数失真
-    von_mises_proxy = float(YOUNG_MODULUS * avg_strain)
+    von_mises_proxy = float(young_modulus * avg_strain)
     return von_mises_proxy, avg_strain
+
+
+def compute_lesion_mask(rest_positions, lesion_center, lesion_radius):
+    if rest_positions.size == 0:
+        return np.array([], dtype=np.int64)
+    dist = np.linalg.norm(rest_positions - lesion_center, axis=1)
+    lesion_indices = np.where(dist <= lesion_radius)[0]
+    if lesion_indices.size == 0:
+        # 至少保留一个最近点，保证病灶指标可计算
+        lesion_indices = np.array([int(np.argmin(dist))], dtype=np.int64)
+    return lesion_indices
+
+
+def compute_tissue_interaction_metrics(
+    tip_position,
+    tissue_positions,
+    tissue_rest_positions,
+    lesion_indices,
+):
+    if tissue_positions.size == 0:
+        return {
+            "lesion_distance": 0.0,
+            "lesion_strain": 0.0,
+            "tissue_strain": 0.0,
+            "contact_distance": 1.0,
+            "contact_proxy": 0.0,
+            "lesion_center": [0.0, 0.0, 0.0],
+        }
+
+    _, tissue_avg_strain = compute_mechanics_metrics(
+        tissue_positions,
+        tissue_rest_positions,
+        TISSUE_YOUNG_MODULUS,
+    )
+    lesion_positions = tissue_positions[lesion_indices]
+    lesion_rest_positions = tissue_rest_positions[lesion_indices]
+    _, lesion_avg_strain = compute_mechanics_metrics(
+        lesion_positions,
+        lesion_rest_positions,
+        TISSUE_YOUNG_MODULUS,
+    )
+    lesion_center = np.mean(lesion_positions, axis=0)
+    lesion_distance = float(np.linalg.norm(tip_position - lesion_center))
+
+    min_contact_distance = float(
+        np.min(np.linalg.norm(tissue_positions - tip_position, axis=1))
+    )
+    contact_proxy = max(
+        0.0,
+        (LESION_CONTACT_RADIUS - min_contact_distance) / max(LESION_CONTACT_RADIUS, 1e-8),
+    )
+    contact_proxy = float(min(contact_proxy, 1.0))
+
+    return {
+        "lesion_distance": lesion_distance,
+        "lesion_strain": float(lesion_avg_strain),
+        "tissue_strain": float(tissue_avg_strain),
+        "contact_distance": min_contact_distance,
+        "contact_proxy": contact_proxy,
+        "lesion_center": lesion_center.tolist(),
+    }
 
 def main():
     root = Sofa.Core.Node("root")
@@ -112,10 +217,19 @@ def main():
     topo_cells = [(cell_type, np.array(topo_val))]
     print(f"成功获取拓扑！类型: {cell_type}, 数量: {len(topo_val)}")
 
-    # --- 以下 ZMQ 和循环逻辑保持不变 ---
     cable = root.SoftBody.cable
-    dofs = root.SoftBody.dofs
-    rest_positions = np.array(dofs.position.value, copy=True)
+    robot_dofs = root.SoftBody.dofs
+    tissue_dofs = root.TargetTissue.dofs
+
+    robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
+    tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
+    lesion_center_ref = np.array([0.05, 0.015, 0.82])
+    lesion_indices = compute_lesion_mask(
+        tissue_rest_positions,
+        lesion_center=lesion_center_ref,
+        lesion_radius=0.025,
+    )
+    print(f"Lesion region nodes: {len(lesion_indices)}")
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
@@ -138,7 +252,8 @@ def main():
                 cable.value = [0.0]
                 # reset 后推进一个小步以刷新位置缓存
                 Sofa.Simulation.animate(root, 0.0001)
-                rest_positions = np.array(dofs.position.value, copy=True)
+                robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
+                tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
             else:
                 # 执行一步控制
                 cable_disp = float(cmd.get("cable_disp", 0.0))
@@ -155,7 +270,7 @@ def main():
                     if not os.path.exists(target_dir):
                         os.makedirs(target_dir)
                     
-                    points = np.array(dofs.position.value)
+                    points = np.array(robot_dofs.position.value)
                     if len(points) > 0 and len(topo_cells) > 0:
                         mesh = meshio.Mesh(points=points, cells=topo_cells)
                         vtk_file = os.path.join(target_dir, f"frame_{step_count:04d}.vtk")
@@ -164,20 +279,46 @@ def main():
                     print(f"VTK Export Error: {e}")
 
             # 反馈当前状态
-            positions = np.array(dofs.position.value)
-            if len(positions) == 0:
+            robot_positions = np.array(robot_dofs.position.value)
+            tissue_positions = np.array(tissue_dofs.position.value)
+            if len(robot_positions) == 0:
                 tip_position = [0.0, 0.0, 0.0]
                 von_mises = 0.0
                 avg_strain = 0.0
+                lesion_metrics = {
+                    "lesion_distance": 0.0,
+                    "lesion_strain": 0.0,
+                    "tissue_strain": 0.0,
+                    "contact_distance": 1.0,
+                    "contact_proxy": 0.0,
+                    "lesion_center": [0.0, 0.0, 0.0],
+                }
             else:
-                tip_position = positions[-1].tolist()
-                von_mises, avg_strain = compute_mechanics_metrics(positions, rest_positions)
+                tip_np = robot_positions[-1]
+                tip_position = tip_np.tolist()
+                von_mises, avg_strain = compute_mechanics_metrics(
+                    robot_positions,
+                    robot_rest_positions,
+                    ROBOT_YOUNG_MODULUS,
+                )
+                lesion_metrics = compute_tissue_interaction_metrics(
+                    tip_position=tip_np,
+                    tissue_positions=tissue_positions,
+                    tissue_rest_positions=tissue_rest_positions,
+                    lesion_indices=lesion_indices,
+                )
 
             reply = {
                 "step": step_count,
                 "tip_position": tip_position,
                 "von_mises": von_mises,
                 "avg_strain": avg_strain,
+                "lesion_distance": lesion_metrics["lesion_distance"],
+                "lesion_strain": lesion_metrics["lesion_strain"],
+                "tissue_strain": lesion_metrics["tissue_strain"],
+                "contact_distance": lesion_metrics["contact_distance"],
+                "contact_proxy": lesion_metrics["contact_proxy"],
+                "lesion_center": lesion_metrics["lesion_center"],
             }
             sock.send_string(json.dumps(reply))
     finally:
