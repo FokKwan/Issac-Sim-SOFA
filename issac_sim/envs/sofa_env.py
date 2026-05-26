@@ -11,6 +11,8 @@ class SoftSofaEnv(gym.Env):
         super().__init__()
         self.sofa = SofaCableClient()
         self.max_episode_steps = int(max_episode_steps)
+        # 增大策略动作到实际缆绳位移的映射，便于早期训练也能产生可见运动
+        self.action_scale = 1.0
         self.max_von_mises = 2500.0
         self.max_avg_strain = 0.45
         self.max_tissue_strain = 0.25
@@ -18,8 +20,8 @@ class SoftSofaEnv(gym.Env):
         self.success_distance = 0.01
 
         # 1. 定义动作空间 (Action Space)
-        # 假设你的缆绳位移 (cable_disp) 是一个介于 -0.5 到 0.5 之间的连续浮点数
-        self.action_space = spaces.Box(low=-0.5, high=0.5, shape=(1,), dtype=np.float32)
+        # 标准化动作空间，发送前再做尺度映射
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
         # 2. 定义观测空间 (Observation Space)
         # 必须与 _build_obs 返回的字典格式严丝合缝
@@ -59,7 +61,9 @@ class SoftSofaEnv(gym.Env):
 
         # 注意：SB3 传进来的 action 是一个 numpy 数组形如 [0.12]
         # 但我们发给 SOFA 的只需要标量，所以要取 action[0] 并转为 float
-        cable_disp = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
+        normalized_action = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
+        normalized_action = float(np.clip(normalized_action, -1.0, 1.0))
+        cable_disp = normalized_action * self.action_scale
         sofa_obs = self.sofa.step(cable_disp=cable_disp)
         if not self._is_valid_sofa_obs(sofa_obs):
             info = {
@@ -91,6 +95,7 @@ class SoftSofaEnv(gym.Env):
             "lesion_distance": float(obs["lesion_distance"][0]),
             "contact_proxy": float(obs["contact_proxy"][0]),
             "success": success,
+            "tip_displacement": float(sofa_obs.get("tip_displacement", 0.0)),
             "communication_error": False,
         }
 

@@ -7,9 +7,12 @@ cd "$REPO_ROOT"
 
 INPUT_GLOB="${INPUT_GLOB:-sofa/vtk_output/frame_*.vtk}"
 OUTPUT_GIF="${OUTPUT_GIF:-logs/sofa_demo.gif}"
-FRAME_STRIDE="${FRAME_STRIDE:-50}"
+FRAME_STRIDE="${FRAME_STRIDE:-10}"
 FPS="${FPS:-12}"
 POINT_SIZE="${POINT_SIZE:-12}"
+MOTION_SCALE="${MOTION_SCALE:-1.0}"
+ELEVATION="${ELEVATION:-20}"
+AZIMUTH="${AZIMUTH:-40}"
 VENV_PATH="${VENV_PATH:-.venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -29,9 +32,12 @@ Examples:
 Environment overrides:
   INPUT_GLOB   Default: sofa/vtk_output/frame_*.vtk
   OUTPUT_GIF   Default: logs/sofa_demo.gif
-  FRAME_STRIDE Default: 50
+  FRAME_STRIDE Default: 10
   FPS          Default: 12
   POINT_SIZE   Default: 12
+  MOTION_SCALE Default: 1.0 (set >1.0 to amplify deformation visually)
+  ELEVATION    Default: 20
+  AZIMUTH      Default: 40
   VENV_PATH    Default: .venv
   PYTHON_BIN   Default: python3 (or .venv/bin/python when available)
 EOF
@@ -60,6 +66,10 @@ if ! [[ "$FPS" =~ ^[0-9]+$ ]] || [[ "$FPS" -lt 1 ]]; then
   echo "[ERROR] FPS must be an integer >= 1" >&2
   exit 1
 fi
+if ! [[ "$MOTION_SCALE" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+  echo "[ERROR] MOTION_SCALE must be a positive number" >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$OUTPUT_GIF")"
 
@@ -77,7 +87,7 @@ ensure_package meshio meshio
 ensure_package matplotlib matplotlib
 ensure_package PIL pillow
 
-export INPUT_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE
+export INPUT_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE ELEVATION AZIMUTH
 
 "$PYTHON_BIN" - <<'PY'
 import glob
@@ -93,6 +103,9 @@ output_gif = os.environ["OUTPUT_GIF"]
 frame_stride = int(os.environ["FRAME_STRIDE"])
 fps = int(os.environ["FPS"])
 point_size = float(os.environ["POINT_SIZE"])
+motion_scale = float(os.environ["MOTION_SCALE"])
+elevation = float(os.environ["ELEVATION"])
+azimuth = float(os.environ["AZIMUTH"])
 
 all_files = sorted(glob.glob(input_glob))
 if not all_files:
@@ -142,11 +155,23 @@ scatter = ax.scatter(
     s=point_size,
     alpha=0.85,
 )
+ax.view_init(elev=elevation, azim=azimuth)
+
+if motion_scale <= 0:
+    raise SystemExit("[ERROR] MOTION_SCALE must be > 0")
+
+def scaled_points(points):
+    if motion_scale == 1.0:
+        return points
+    return first_points + motion_scale * (points - first_points)
 
 def update(frame_idx):
     _path, points = point_clouds[frame_idx]
-    scatter._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
-    ax.set_title(f"SOFA deformation demo ({frame_idx + 1}/{len(point_clouds)})")
+    render_points = scaled_points(points)
+    scatter._offsets3d = (render_points[:, 0], render_points[:, 1], render_points[:, 2])
+    ax.set_title(
+        f"SOFA deformation demo ({frame_idx + 1}/{len(point_clouds)}) | motion_scale={motion_scale:.2f}"
+    )
     return (scatter,)
 
 ani = FuncAnimation(
@@ -160,6 +185,15 @@ writer = PillowWriter(fps=fps)
 ani.save(output_gif, writer=writer)
 plt.close(fig)
 
+tip_displacements = [
+    float(np.linalg.norm(points[-1] - first_points[-1]))
+    for _, points in point_clouds
+]
 print(f"[OK] Saved GIF: {output_gif}")
 print(f"[INFO] Input frames: {len(all_files)}, rendered frames: {len(point_clouds)}, stride: {frame_stride}")
+print(
+    "[INFO] Tip displacement stats (raw meters): "
+    f"min={min(tip_displacements):.6f}, max={max(tip_displacements):.6f}, "
+    f"mean={float(np.mean(tip_displacements)):.6f}"
+)
 PY

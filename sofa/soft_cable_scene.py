@@ -16,6 +16,9 @@ ROBOT_POISSON_RATIO = 0.45
 TISSUE_YOUNG_MODULUS = 1200.0
 TISSUE_POISSON_RATIO = 0.46
 LESION_CONTACT_RADIUS = 0.03
+CABLE_DISP_LIMIT = 1.5
+CABLE_DISP_SCALE = 1.0
+DEFAULT_EXPORT_INTERVAL = 10
 
 def createScene(root):
     """
@@ -37,6 +40,7 @@ def createScene(root):
     soft = root.addChild("SoftBody")
     soft.addObject("EulerImplicitSolver")
     soft.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
+    soft.addObject("LinearSolverConstraintCorrection")
     
     # 使用 RegularGridTopology 自动生成 3x3x10 的网格 (共90个点)
     soft.addObject('RegularGridTopology', name='grid', 
@@ -58,6 +62,14 @@ def createScene(root):
     
     soft.addObject("UniformMass", totalMass=0.5)
     soft.addObject("PointCollisionModel", group=1)
+    # 固定机器人基座，避免整体刚体漂移导致“看起来没有弯曲运动”
+    soft.addObject(
+        "BoxROI",
+        name="base_roi",
+        box=[-0.001, -0.001, -0.001, 0.101, 0.101, 0.08],
+        drawBoxes=False,
+    )
+    soft.addObject("FixedConstraint", indices="@base_roi.indices")
 
     # 缆绳约束：索引需在网格点数范围内
     soft.addObject(
@@ -73,6 +85,7 @@ def createScene(root):
     tissue = root.addChild("TargetTissue")
     tissue.addObject("EulerImplicitSolver")
     tissue.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
+    tissue.addObject("LinearSolverConstraintCorrection")
     tissue.addObject(
         "RegularGridTopology",
         name="grid",
@@ -223,6 +236,7 @@ def main():
 
     robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
+    rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
     lesion_center_ref = np.array([0.05, 0.015, 0.82])
     lesion_indices = compute_lesion_mask(
         tissue_rest_positions,
@@ -237,6 +251,8 @@ def main():
     
     if not os.path.exists('vtk_output'): os.makedirs('vtk_output')
     print("[SOFA] Headless Server Ready (Manual Export Mode)...")
+    export_interval = max(1, int(os.environ.get("SOFA_EXPORT_INTERVAL", str(DEFAULT_EXPORT_INTERVAL))))
+    print(f"[SOFA] Export interval: every {export_interval} steps")
 
     step_count = 0
 
@@ -254,17 +270,19 @@ def main():
                 Sofa.Simulation.animate(root, 0.0001)
                 robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
                 tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
+                rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
             else:
                 # 执行一步控制
-                cable_disp = float(cmd.get("cable_disp", 0.0))
+                raw_cable_disp = float(cmd.get("cable_disp", 0.0))
+                cable_disp = float(np.clip(raw_cable_disp * CABLE_DISP_SCALE, -CABLE_DISP_LIMIT, CABLE_DISP_LIMIT))
                 cable.value = [cable_disp]
                 
                 # 物理步进
                 Sofa.Simulation.animate(root, float(root.dt.value))
                 step_count += 1
 
-            # 每 10 步导出一次 VTK 供 ParaView 查看
-            if step_count % 10 == 0:
+            # 周期导出 VTK 供 ParaView / GIF 可视化
+            if step_count % export_interval == 0:
                 try:
                     target_dir = 'vtk_output'
                     if not os.path.exists(target_dir):
@@ -296,6 +314,7 @@ def main():
             else:
                 tip_np = robot_positions[-1]
                 tip_position = tip_np.tolist()
+                tip_displacement = float(np.linalg.norm(tip_np - rest_tip_position))
                 von_mises, avg_strain = compute_mechanics_metrics(
                     robot_positions,
                     robot_rest_positions,
@@ -307,10 +326,13 @@ def main():
                     tissue_rest_positions=tissue_rest_positions,
                     lesion_indices=lesion_indices,
                 )
+            if len(robot_positions) == 0:
+                tip_displacement = 0.0
 
             reply = {
                 "step": step_count,
                 "tip_position": tip_position,
+                "tip_displacement": tip_displacement,
                 "von_mises": von_mises,
                 "avg_strain": avg_strain,
                 "lesion_distance": lesion_metrics["lesion_distance"],
