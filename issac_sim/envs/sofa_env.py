@@ -12,7 +12,7 @@ class SoftSofaEnv(gym.Env):
     """
     符合 Stable-Baselines3 / Gymnasium 标准接口的 SOFA 环境
     """
-    def __init__(self, max_episode_steps=1000):
+    def __init__(self, max_episode_steps=400):
         """
         Args:
             max_episode_steps: 单个 episode 最大步数，超过后 truncated=True。
@@ -22,19 +22,24 @@ class SoftSofaEnv(gym.Env):
         self.max_episode_steps = int(max_episode_steps)
         # 归一化动作到物理控制量的缩放系数：
         # SOFA 实际控制量 cable_disp = action * action_scale
-        self.action_scale = 1.0
+        self.action_scale = 1.2
         # 安全阈值参数（用于 done 判定）
         self.max_von_mises = 2500.0
         self.max_avg_strain = 0.45
-        self.max_tissue_strain = 0.25
-        self.max_lesion_strain = 0.20
+        self.max_tissue_strain = 0.35
+        self.max_lesion_strain = 0.30
         # 接触力阈值参数：
         # - min_contact_force: 成功接触的下限（避免“无接触假成功”）
         # - max_contact_force: 成功接触的上限（避免过压）
-        self.max_contact_force = 2.0
-        self.min_contact_force = 0.01
+        self.max_contact_force = 1.4
+        self.min_contact_force = 0.02
         # 成功距离阈值（tip 到病灶中心）
-        self.success_distance = 0.01
+        self.success_distance = 0.035
+        # 奖励整形参数
+        self.desired_contact_force = 0.40
+        self.contact_force_sigma = 0.20
+        self.progress_gain = 6.0
+        self.time_penalty = 0.002
 
         # 1. 定义动作空间 (Action Space)
         # 标准化动作空间，发送前再做尺度映射
@@ -65,6 +70,8 @@ class SoftSofaEnv(gym.Env):
         })
         # 通信异常兜底：保留上一帧有效观测，避免训练循环崩溃
         self._last_obs = self._build_obs(self._default_sofa_obs())
+        self._prev_lesion_distance = float(self._last_obs["lesion_distance"][0])
+        self._last_progress = 0.0
 
     def reset(self, seed=None, options=None):
         # 兼容最新版 gymnasium 规范，必须带 seed
@@ -81,6 +88,8 @@ class SoftSofaEnv(gym.Env):
 
         obs = self._build_obs(sofa_obs)
         self._last_obs = obs
+        self._prev_lesion_distance = float(obs["lesion_distance"][0])
+        self._last_progress = 0.0
 
         # 必须要返回 obs 和 info 两个变量
         return obs, info
@@ -111,6 +120,7 @@ class SoftSofaEnv(gym.Env):
         obs = self._build_obs(sofa_obs)
         self._last_obs = obs
         reward = float(self._compute_reward(obs))
+        self._prev_lesion_distance = float(obs["lesion_distance"][0])
         
         # terminated: 安全超限或任务成功；truncated: 达到步数上限
         terminated = self._check_done(obs)
@@ -128,6 +138,7 @@ class SoftSofaEnv(gym.Env):
             "contact_force_peak": float(obs["contact_force_peak"][0]),
             "contact_force_total": float(obs["contact_force_total"][0]),
             "success": success,
+            "distance_progress": self._last_progress,
             "tip_displacement": float(sofa_obs.get("tip_displacement", 0.0)),
             "communication_error": False,
         }
@@ -166,22 +177,38 @@ class SoftSofaEnv(gym.Env):
         # 奖励设计：
         # 1) task_term: 鼓励靠近病灶（距离越小越高）
         lesion_distance = float(obs["lesion_distance"][0])
-        task_term = -lesion_distance
+        task_term = -1.2 * lesion_distance
+        # 2) progress_term: 奖励相对上一步的距离改善，降低“原地抖动”
+        progress = self._prev_lesion_distance - lesion_distance
+        self._last_progress = float(progress)
+        progress_term = self.progress_gain * float(np.clip(progress, -0.05, 0.05))
         contact_force_peak = float(obs["contact_force_peak"][0])
-        # 2) contact_term: 鼓励适度接触，离病灶越近权重越高
-        contact_term = 0.3 * np.tanh(contact_force_peak) * np.exp(-3.0 * lesion_distance)
-        # 3) safety_penalty: 惩罚机器人/组织/病灶应变
-        safety_penalty = (
-            0.06 * float(obs["von_mises"][0])
-            + 0.08 * float(obs["avg_strain"][0])
-            + 0.18 * float(obs["tissue_strain"][0])
-            + 0.22 * float(obs["lesion_strain"][0])
+        # 3) contact_term: 鼓励接触力接近期望区间，且距离病灶越近权重越高
+        contact_alignment = np.exp(
+            -((contact_force_peak - self.desired_contact_force) ** 2)
+            / (2.0 * self.contact_force_sigma ** 2)
         )
-        # 4) excessive_contact_penalty: 对过大接触力进行二次惩罚
-        excessive_contact_penalty = 0.35 * max(contact_force_peak - self.max_contact_force, 0.0) ** 2
-        # 5) success_bonus: 达成任务时给一次额外奖励
-        success_bonus = 5.0 if self._is_success(obs) else 0.0
-        return task_term + contact_term - safety_penalty - excessive_contact_penalty + success_bonus
+        contact_term = 0.8 * contact_alignment * np.exp(-2.0 * lesion_distance)
+        # 4) safety_penalty: 惩罚机器人/组织/病灶应变
+        safety_penalty = (
+            0.03 * float(obs["von_mises"][0])
+            + 0.05 * float(obs["avg_strain"][0])
+            + 0.10 * float(obs["tissue_strain"][0])
+            + 0.14 * float(obs["lesion_strain"][0])
+        )
+        # 5) excessive_contact_penalty: 对过大接触力进行二次惩罚
+        excessive_contact_penalty = 0.5 * max(contact_force_peak - self.max_contact_force, 0.0) ** 2
+        # 6) success_bonus: 达成任务时给一次额外奖励
+        success_bonus = 8.0 if self._is_success(obs) else 0.0
+        return (
+            task_term
+            + progress_term
+            + contact_term
+            - safety_penalty
+            - excessive_contact_penalty
+            - self.time_penalty
+            + success_bonus
+        )
 
     def _check_done(self, obs):
         # 任何安全指标超阈值即终止，避免策略学习到危险操作
@@ -190,7 +217,7 @@ class SoftSofaEnv(gym.Env):
             or obs["avg_strain"][0] > self.max_avg_strain
             or obs["tissue_strain"][0] > self.max_tissue_strain
             or obs["lesion_strain"][0] > self.max_lesion_strain
-            or obs["contact_force_peak"][0] > 2.5 * self.max_contact_force
+            or obs["contact_force_peak"][0] > 3.0 * self.max_contact_force
         )
 
     def _is_success(self, obs):

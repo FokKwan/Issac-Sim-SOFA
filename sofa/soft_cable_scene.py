@@ -30,8 +30,8 @@ PCC_SEGMENT_LENGTHS = [0.25, 0.25, 0.25, 0.25]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.85, 0.70, 0.55]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 4.0  # 1/m
-# 机器人基座初始偏移（确保初始不与组织接触）
-PCC_BASE_OFFSET = np.array([-0.12, 0.0, 0.0], dtype=np.float64)
+# 机器人基座初始偏移（右侧固定，主轴沿 x 方向）
+PCC_BASE_OFFSET = np.array([0.45, 0.03, 0.0], dtype=np.float64)
 # 缆绳控制参数：限制绝对位移，避免数值发散
 CABLE_DISP_LIMIT = 1.5
 CABLE_DISP_SCALE = 1.0
@@ -69,9 +69,9 @@ def generate_segmented_constant_curvature_points(curvature_command):
         ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
         for _ in range(PCC_POINTS_PER_SEGMENT):
             theta += seg_kappa * ds
-            # 平面常曲率：弯曲发生在 X-Z 平面
-            current[0] += np.sin(theta) * ds
-            current[2] += np.cos(theta) * ds
+            # 平面常曲率：主轴沿 X，弯曲发生在 X-Y 平面（向下接触组织）
+            current[0] -= np.cos(theta) * ds
+            current[1] -= np.sin(theta) * ds
             points.append(current.copy())
     return np.asarray(points, dtype=np.float64)
 
@@ -128,11 +128,11 @@ def createScene(root):
     tissue.addObject(
         "RegularGridTopology",
         name="grid",
-        min=[-0.03, -0.02, 0.72],
-        max=[0.13, 0.05, 0.94],
-        nx=8,
-        ny=5,
-        nz=6,
+        min=[-0.18, -0.18, -0.06],
+        max=[0.25, -0.06, 0.06],
+        nx=10,
+        ny=6,
+        nz=5,
     )
     tissue.addObject("MechanicalObject", name="dofs", template="Vec3d")
     # 组织材料参数（更软）
@@ -149,7 +149,7 @@ def createScene(root):
     tissue.addObject(
         "BoxROI",
         name="fixed_roi",
-        box=[-0.04, -0.021, 0.70, 0.14, -0.013, 0.96],
+        box=[-0.19, -0.181, -0.07, 0.26, -0.171, 0.07],
         drawBoxes=False,
     )
     tissue.addObject("FixedConstraint", indices="@fixed_roi.indices")
@@ -365,7 +365,7 @@ def main():
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
     rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
     # 病灶初始中心（可作为任务配置参数暴露给上层）
-    lesion_center_ref = np.array([0.05, 0.015, 0.82])
+    lesion_center_ref = np.array([0.08, -0.12, 0.0])
     lesion_indices = compute_lesion_mask(
         tissue_rest_positions,
         lesion_center=lesion_center_ref,
