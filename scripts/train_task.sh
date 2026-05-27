@@ -17,9 +17,23 @@ TIMESTEPS="${TIMESTEPS:-100000}"
 EVAL_STEPS="${EVAL_STEPS:-100}"
 VENV_PATH="${VENV_PATH:-.venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+SOFA_CONDA_ENV="${SOFA_CONDA_ENV:-sofa_rl}"
+SOFA_PYTHON_BIN="${SOFA_PYTHON_BIN:-python}"
+TRAIN_PYTHON_BIN="${TRAIN_PYTHON_BIN:-}"
+TRAIN_ENTRY="${TRAIN_ENTRY:-issac_sim/run_env.py}"
+CONDA_BASE="${CONDA_BASE:-}"
 
 if [[ -x "$VENV_PATH/bin/python" ]]; then
   PYTHON_BIN="$VENV_PATH/bin/python"
+fi
+if [[ -z "$TRAIN_PYTHON_BIN" && -x "$HOME/omniverse/python.sh" ]]; then
+  TRAIN_PYTHON_BIN="$HOME/omniverse/python.sh"
+fi
+if [[ -z "$TRAIN_PYTHON_BIN" ]]; then
+  TRAIN_PYTHON_BIN="$PYTHON_BIN"
+fi
+if [[ -z "$SOFA_PYTHON_BIN" ]]; then
+  SOFA_PYTHON_BIN="$PYTHON_BIN"
 fi
 
 usage() {
@@ -35,12 +49,22 @@ Environment variables:
   TIMESTEPS    Training timesteps (default: 100000)
   EVAL_STEPS   Eval rollout steps (default: 100)
   VENV_PATH    Virtual env path (default: .venv)
-  PYTHON_BIN   Python binary override (default: python3 or .venv/bin/python)
+  PYTHON_BIN   Base Python fallback (default: python3 or .venv/bin/python)
+  SOFA_CONDA_ENV  Conda env for SOFA server (default: sofa_rl, empty disables conda activation)
+  SOFA_PYTHON_BIN Python executable inside SOFA env (default: python)
+  TRAIN_PYTHON_BIN Python executable for RL training (default: ~/omniverse/python.sh if exists)
+  TRAIN_ENTRY      Training entry script/module argument (default: issac_sim/run_env.py)
+  CONDA_BASE       Conda base path override (e.g. ~/miniconda3)
   SOFA_SESSION tmux session name for SOFA (default: sofa-server)
   TRAIN_SESSION tmux session name for training (default: rl-train)
   LOG_DIR      Log directory (default: logs)
 EOF
 }
+
+if [[ "$ACTION" == "-h" || "$ACTION" == "--help" ]]; then
+  usage
+  exit 0
+fi
 
 require_tmux() {
   if ! command -v tmux >/dev/null 2>&1; then
@@ -54,15 +78,59 @@ has_session() {
   tmux has-session -t "=${session_name}" 2>/dev/null
 }
 
+resolve_conda_base() {
+  if [[ -z "$CONDA_BASE" ]]; then
+    if command -v conda >/dev/null 2>&1; then
+      CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+    elif [[ -d "$HOME/miniconda3" ]]; then
+      CONDA_BASE="$HOME/miniconda3"
+    elif [[ -d "$HOME/anaconda3" ]]; then
+      CONDA_BASE="$HOME/anaconda3"
+    fi
+  fi
+}
+
+build_sofa_command() {
+  if [[ -n "$SOFA_CONDA_ENV" ]]; then
+    resolve_conda_base
+    if [[ -z "$CONDA_BASE" || ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+      echo "[ERROR] SOFA_CONDA_ENV=$SOFA_CONDA_ENV set, but conda.sh not found. Set CONDA_BASE manually." >&2
+      return 1
+    fi
+    printf "%s" "source \"$CONDA_BASE/etc/profile.d/conda.sh\" && conda activate \"$SOFA_CONDA_ENV\" && cd \"$REPO_ROOT/sofa\" && \"$SOFA_PYTHON_BIN\" soft_cable_scene.py 2>&1 | tee \"$SOFA_LOG\""
+  else
+    printf "%s" "cd \"$REPO_ROOT\" && \"$SOFA_PYTHON_BIN\" sofa/soft_cable_scene.py 2>&1 | tee \"$SOFA_LOG\""
+  fi
+}
+
+build_train_command() {
+  printf "%s" "cd \"$REPO_ROOT\" && \"$TRAIN_PYTHON_BIN\" \"$TRAIN_ENTRY\" --total-timesteps \"$TIMESTEPS\" --eval-steps \"$EVAL_STEPS\" 2>&1 | tee \"$TRAIN_LOG\""
+}
+
+ensure_session_alive_or_fail() {
+  local session_name="$1"
+  local log_file="$2"
+  sleep 2
+  if ! has_session "$session_name"; then
+    echo "[ERROR] Session exited immediately: $session_name" >&2
+    echo "[ERROR] Last logs from $log_file:" >&2
+    tail -n 60 "$log_file" >&2 || true
+    return 1
+  fi
+}
+
 start_sofa() {
   if has_session "$SOFA_SESSION"; then
     echo "[INFO] SOFA session already running: $SOFA_SESSION"
     return
   fi
 
+  local sofa_cmd
+  sofa_cmd="$(build_sofa_command)"
   mkdir -p "$LOG_DIR"
   tmux new-session -d -s "$SOFA_SESSION" \
-    "cd \"$REPO_ROOT\" && \"$PYTHON_BIN\" sofa/soft_cable_scene.py 2>&1 | tee \"$SOFA_LOG\""
+    "bash -lc '$sofa_cmd'"
+  ensure_session_alive_or_fail "$SOFA_SESSION" "$SOFA_LOG"
   echo "[OK] SOFA server started in tmux session: $SOFA_SESSION"
 }
 
@@ -72,9 +140,12 @@ start_training() {
     return
   fi
 
+  local train_cmd
+  train_cmd="$(build_train_command)"
   mkdir -p "$LOG_DIR"
   tmux new-session -d -s "$TRAIN_SESSION" \
-    "cd \"$REPO_ROOT\" && \"$PYTHON_BIN\" -m issac_sim.run_env --total-timesteps \"$TIMESTEPS\" --eval-steps \"$EVAL_STEPS\" 2>&1 | tee \"$TRAIN_LOG\""
+    "bash -lc '$train_cmd'"
+  ensure_session_alive_or_fail "$TRAIN_SESSION" "$TRAIN_LOG"
   echo "[OK] Training started in tmux session: $TRAIN_SESSION"
 }
 
@@ -90,7 +161,10 @@ stop_session() {
 
 show_status() {
   echo "Repository: $REPO_ROOT"
-  echo "Python: $PYTHON_BIN"
+  echo "SOFA env: ${SOFA_CONDA_ENV:-<disabled>}"
+  echo "SOFA python: $SOFA_PYTHON_BIN"
+  echo "TRAIN python: $TRAIN_PYTHON_BIN"
+  echo "TRAIN entry: $TRAIN_ENTRY"
   echo "SOFA session ($SOFA_SESSION): $(has_session "$SOFA_SESSION" && echo running || echo stopped)"
   echo "TRAIN session ($TRAIN_SESSION): $(has_session "$TRAIN_SESSION" && echo running || echo stopped)"
   echo "Logs:"
