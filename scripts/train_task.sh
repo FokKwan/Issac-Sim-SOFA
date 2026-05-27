@@ -10,6 +10,9 @@ ACTION="${1:-}"
 SOFA_SESSION="${SOFA_SESSION:-sofa-server}"
 TRAIN_SESSION="${TRAIN_SESSION:-rl-train}"
 LOG_DIR="${LOG_DIR:-logs}"
+if [[ "$LOG_DIR" != /* ]]; then
+  LOG_DIR="$REPO_ROOT/$LOG_DIR"
+fi
 SOFA_LOG="$LOG_DIR/sofa_server.log"
 TRAIN_LOG="$LOG_DIR/train.log"
 
