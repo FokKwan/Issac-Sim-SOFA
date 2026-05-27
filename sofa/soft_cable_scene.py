@@ -7,25 +7,43 @@ import json
 import os
 import meshio
 
+# 本文件是 SOFA 物理服务器入口，负责：
+# 1) 构建“连续体机器人 + 组织 + 病灶”同场景仿真
+# 2) 接收 Isaac/RL 发来的控制指令并步进仿真
+# 3) 回传可用于训练的状态与安全指标
+#
+# 运行方式：python soft_cable_scene.py
+# 对外接口：ZMQ REP 监听 tcp://*:5555（与 Isaac 侧 REQ 对接）
+
 # 确保加载核心插件
 SofaRuntime.importPlugin("Sofa.Component")
 SofaRuntime.importPlugin("SoftRobots")
 
+# 机器人材料参数（线弹性近似）
 ROBOT_YOUNG_MODULUS = 3000.0
 ROBOT_POISSON_RATIO = 0.45
+# 组织材料参数（更软）
 TISSUE_YOUNG_MODULUS = 1200.0
 TISSUE_POISSON_RATIO = 0.46
+# 缆绳控制参数：限制绝对位移，避免数值发散
 CABLE_DISP_LIMIT = 1.5
 CABLE_DISP_SCALE = 1.0
+# VTK 导出默认间隔（每 N 个仿真 step 导出一次）
 DEFAULT_EXPORT_INTERVAL = 10
+# 力统计距离门限：距离大于该值时视作“非接触”
 CONTACT_FORCE_DISTANCE_GATE = 0.004
 
 def createScene(root):
     """
-    构建软体机器人+目标组织+病灶区域场景
+    构建软体机器人+目标组织+病灶区域场景。
+
+    Args:
+        root: SOFA 根节点
     """
+    # 全局积分步长与重力
     root.dt = 0.01
     root.gravity = [0, -9.81, 0]
+    # 约束求解循环：适用于接触/约束问题
     root.addObject("FreeMotionAnimationLoop")
     root.addObject(
         "GenericConstraintSolver",
@@ -35,7 +53,9 @@ def createScene(root):
         computeConstraintForces=True,
     )
 
-    # 基础接触流水线，让软体机器人和组织在同一 SOFA 物理世界交互
+    # 基础接触流水线：
+    # - LocalMinDistance 的 alarmDistance/contactDistance 控制接触检测敏感度
+    # - CollisionResponse 使用摩擦接触约束，mu 为摩擦系数
     root.addObject("CollisionPipeline")
     root.addObject("BruteForceBroadPhase")
     root.addObject("BVHNarrowPhase")
@@ -49,10 +69,12 @@ def createScene(root):
 
     # 1) 连续体机器人节点
     soft = root.addChild("SoftBody")
+    # 隐式积分 + 共轭梯度线性求解器（稳定性更好）
     soft.addObject("EulerImplicitSolver")
     soft.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
     
-    # 使用 RegularGridTopology 自动生成 3x3x10 的网格 (共90个点)
+    # 机器人体网格：
+    # min/max 控制几何包围盒，nx/ny/nz 控制网格分辨率
     soft.addObject('RegularGridTopology', name='grid', 
                    min=[0, 0, 0], max=[0.1, 0.1, 1.0], 
                    nx=3, ny=3, nz=10)
@@ -60,7 +82,8 @@ def createScene(root):
     # 状态量容器
     soft.addObject("MechanicalObject", name="dofs", template="Vec3d")
     
-    # RegularGridTopology 生成的是 hexa 网格，配套使用 HexahedronFEMForceField
+    # RegularGridTopology 生成 hexa 网格，故使用 HexahedronFEMForceField
+    # method="large" 允许较大形变
     soft.addObject(
         "HexahedronFEMForceField",
         name="fem",
@@ -82,6 +105,8 @@ def createScene(root):
     soft.addObject("FixedConstraint", indices="@base_roi.indices")
 
     # 缆绳约束：索引需在网格点数范围内
+    # valueType="displacement" 表示直接控制位移，不是力控制
+    # pullPoint 定义牵引参考点
     soft.addObject(
         "CableConstraint",
         name="cable",
@@ -95,6 +120,7 @@ def createScene(root):
     tissue = root.addChild("TargetTissue")
     tissue.addObject("EulerImplicitSolver")
     tissue.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
+    # 组织网格参数（比机器人更密）
     tissue.addObject(
         "RegularGridTopology",
         name="grid",
@@ -105,6 +131,7 @@ def createScene(root):
         nz=6,
     )
     tissue.addObject("MechanicalObject", name="dofs", template="Vec3d")
+    # 组织材料参数（更软）
     tissue.addObject(
         "HexahedronFEMForceField",
         name="fem",
@@ -114,6 +141,7 @@ def createScene(root):
         poissonRatio=TISSUE_POISSON_RATIO,
     )
     tissue.addObject("UniformMass", totalMass=0.8)
+    # 固定组织部分边界，模拟与周围组织连接
     tissue.addObject(
         "BoxROI",
         name="fixed_roi",
@@ -126,6 +154,17 @@ def createScene(root):
 
 
 def compute_mechanics_metrics(positions, rest_positions, young_modulus):
+    """
+    用位移场构造代理应力/应变指标（训练信号近似）。
+
+    Args:
+        positions: 当前节点坐标 (N,3)
+        rest_positions: 参考坐标 (N,3)
+        young_modulus: 对应材料杨氏模量
+
+    Returns:
+        (von_mises_proxy, avg_strain)
+    """
     if positions.size == 0 or rest_positions.size == 0:
         return 0.0, 0.0
 
@@ -142,6 +181,14 @@ def compute_mechanics_metrics(positions, rest_positions, young_modulus):
 
 
 def compute_lesion_mask(rest_positions, lesion_center, lesion_radius):
+    """
+    在组织参考网格中生成病灶节点索引。
+
+    Args:
+        rest_positions: 组织参考坐标
+        lesion_center: 病灶中心
+        lesion_radius: 病灶半径
+    """
     if rest_positions.size == 0:
         return np.array([], dtype=np.int64)
     dist = np.linalg.norm(rest_positions - lesion_center, axis=1)
@@ -158,6 +205,17 @@ def compute_tissue_interaction_metrics(
     tissue_rest_positions,
     lesion_indices,
 ):
+    """
+    计算机器人末端与组织/病灶的几何与应变关系。
+
+    Returns:
+        dict:
+            lesion_distance: 末端到病灶中心距离
+            lesion_strain: 病灶区域应变
+            tissue_strain: 组织整体应变
+            contact_distance: 末端到组织最近点距离
+            lesion_center: 病灶中心坐标
+    """
     if tissue_positions.size == 0:
         return {
             "lesion_distance": 0.0,
@@ -195,6 +253,10 @@ def compute_tissue_interaction_metrics(
 
 
 def extract_topology_cells(grid_component):
+    """
+    从 SOFA 拓扑对象提取 meshio 可写的 cells。
+    优先级：hexahedron > tetra > triangle。
+    """
     topo_val = grid_component.hexahedra.value
     cell_type = "hexahedron"
     if len(topo_val) == 0:
@@ -212,6 +274,17 @@ def extract_topology_cells(grid_component):
 
 
 def compute_contact_force_stats(constraint_forces, baseline_force_level, contact_distance):
+    """
+    从约束求解器力向量统计接触力强度。
+
+    Args:
+        constraint_forces: 求解器约束力向量
+        baseline_force_level: reset 时的基线力统计(mean, peak, total)
+        contact_distance: 几何接触距离（用于剔除远距离噪声）
+
+    Returns:
+        (force_mean, force_peak, force_total)
+    """
     if constraint_forces is None:
         return 0.0, 0.0, 0.0
     force_array = np.asarray(constraint_forces, dtype=np.float64).reshape(-1)
@@ -234,6 +307,7 @@ def compute_contact_force_stats(constraint_forces, baseline_force_level, contact
 
 
 def read_constraint_forces(constraint_solver):
+    """安全读取 constraintForces，失败则返回空数组。"""
     try:
         raw_values = constraint_solver.constraintForces.value
     except Exception:
@@ -241,6 +315,7 @@ def read_constraint_forces(constraint_solver):
     return np.asarray(raw_values, dtype=np.float64).reshape(-1)
 
 def main():
+    """SOFA headless 服务主循环。"""
     root = Sofa.Core.Node("root")
     createScene(root)
     
@@ -252,6 +327,7 @@ def main():
     print("正在激活网格拓扑...")
     Sofa.Simulation.animate(root, 0.0001) 
 
+    # 提取机器人和组织拓扑，供 VTK 导出
     robot_topo_cells = extract_topology_cells(root.SoftBody.grid)
     tissue_topo_cells = extract_topology_cells(root.TargetTissue.grid)
     if robot_topo_cells is None or tissue_topo_cells is None:
@@ -267,6 +343,7 @@ def main():
     robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
     rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
+    # 病灶初始中心（可作为任务配置参数暴露给上层）
     lesion_center_ref = np.array([0.05, 0.015, 0.82])
     lesion_indices = compute_lesion_mask(
         tissue_rest_positions,
@@ -278,6 +355,7 @@ def main():
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
+    # ZMQ REP 端口，与 Isaac 侧 REQ 一一配对通信
     sock.bind("tcp://*:5555")
     
     robot_vtk_dir = os.path.join("vtk_output", "robot")
@@ -285,6 +363,7 @@ def main():
     os.makedirs(robot_vtk_dir, exist_ok=True)
     os.makedirs(tissue_vtk_dir, exist_ok=True)
     print("[SOFA] Headless Server Ready (Manual Export Mode)...")
+    # SOFA_EXPORT_INTERVAL 可通过环境变量覆盖，便于平衡 IO 和可视化密度
     export_interval = max(1, int(os.environ.get("SOFA_EXPORT_INTERVAL", str(DEFAULT_EXPORT_INTERVAL))))
     print(f"[SOFA] Export interval: every {export_interval} steps")
 
@@ -297,6 +376,7 @@ def main():
             cmd = json.loads(msg)
 
             if cmd.get("type") == "reset":
+                # reset：重置场景、控制量与参考状态，用于 episode 开始
                 Sofa.Simulation.reset(root)
                 step_count = 0
                 cable.value = [0.0]
@@ -305,6 +385,7 @@ def main():
                 robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
                 tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
                 rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
+                # 记录 reset 基线约束力，用于运行时剔除静态约束背景噪声
                 solver_forces = read_constraint_forces(root.constraint_solver)
                 if solver_forces.size > 0:
                     abs_solver_forces = np.abs(solver_forces)
@@ -318,6 +399,7 @@ def main():
             else:
                 # 执行一步控制
                 raw_cable_disp = float(cmd.get("cable_disp", 0.0))
+                # 动作缩放+限幅，防止超大控制导致数值问题
                 cable_disp = float(np.clip(raw_cable_disp * CABLE_DISP_SCALE, -CABLE_DISP_LIMIT, CABLE_DISP_LIMIT))
                 cable.value = [cable_disp]
                 
@@ -330,6 +412,7 @@ def main():
                 try:
                     robot_points = np.array(robot_dofs.position.value)
                     tissue_points = np.array(tissue_dofs.position.value)
+                    # 分别导出机器人与组织，便于叠加动画
                     if len(robot_points) > 0:
                         robot_mesh = meshio.Mesh(points=robot_points, cells=robot_topo_cells)
                         robot_file = os.path.join(robot_vtk_dir, f"frame_{step_count:04d}.vtk")
@@ -370,6 +453,7 @@ def main():
                     tissue_rest_positions=tissue_rest_positions,
                     lesion_indices=lesion_indices,
                 )
+            # 读取约束力统计作为真实接触信号
             contact_force_mean, contact_force_peak, contact_force_total = compute_contact_force_stats(
                 constraint_forces=read_constraint_forces(root.constraint_solver),
                 baseline_force_level=baseline_force_level,
@@ -382,6 +466,7 @@ def main():
                 contact_force_total = 0.0
 
             reply = {
+                # step: SOFA 物理步计数
                 "step": step_count,
                 "tip_position": tip_position,
                 "tip_displacement": tip_displacement,
