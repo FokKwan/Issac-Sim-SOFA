@@ -15,10 +15,10 @@ ROBOT_YOUNG_MODULUS = 3000.0
 ROBOT_POISSON_RATIO = 0.45
 TISSUE_YOUNG_MODULUS = 1200.0
 TISSUE_POISSON_RATIO = 0.46
-LESION_CONTACT_RADIUS = 0.03
 CABLE_DISP_LIMIT = 1.5
 CABLE_DISP_SCALE = 1.0
 DEFAULT_EXPORT_INTERVAL = 10
+CONTACT_FORCE_DISTANCE_GATE = 0.004
 
 def createScene(root):
     """
@@ -27,14 +27,25 @@ def createScene(root):
     root.dt = 0.01
     root.gravity = [0, -9.81, 0]
     root.addObject("FreeMotionAnimationLoop")
-    root.addObject("GenericConstraintSolver", maxIterations=300, tolerance=1.0e-6)
+    root.addObject(
+        "GenericConstraintSolver",
+        name="constraint_solver",
+        maxIterations=300,
+        tolerance=1.0e-6,
+        computeConstraintForces=True,
+    )
 
     # 基础接触流水线，让软体机器人和组织在同一 SOFA 物理世界交互
     root.addObject("CollisionPipeline")
     root.addObject("BruteForceBroadPhase")
     root.addObject("BVHNarrowPhase")
     root.addObject("LocalMinDistance", alarmDistance=0.006, contactDistance=0.002, angleCone=0.0)
-    root.addObject("CollisionResponse", response="FrictionContactConstraint", responseParams="mu=0.2")
+    root.addObject(
+        "CollisionResponse",
+        name="contact_response",
+        response="FrictionContactConstraint",
+        responseParams="mu=0.2",
+    )
 
     # 1) 连续体机器人节点
     soft = root.addChild("SoftBody")
@@ -60,7 +71,7 @@ def createScene(root):
     )
     
     soft.addObject("UniformMass", totalMass=0.5)
-    soft.addObject("PointCollisionModel", group=1)
+    soft.addObject("PointCollisionModel", name="collision", group=1)
     # 固定机器人基座，避免整体刚体漂移导致“看起来没有弯曲运动”
     soft.addObject(
         "BoxROI",
@@ -110,7 +121,7 @@ def createScene(root):
         drawBoxes=False,
     )
     tissue.addObject("FixedConstraint", indices="@fixed_roi.indices")
-    tissue.addObject("PointCollisionModel", group=2)
+    tissue.addObject("PointCollisionModel", name="collision", group=2)
     return root
 
 
@@ -153,7 +164,6 @@ def compute_tissue_interaction_metrics(
             "lesion_strain": 0.0,
             "tissue_strain": 0.0,
             "contact_distance": 1.0,
-            "contact_proxy": 0.0,
             "lesion_center": [0.0, 0.0, 0.0],
         }
 
@@ -175,20 +185,60 @@ def compute_tissue_interaction_metrics(
     min_contact_distance = float(
         np.min(np.linalg.norm(tissue_positions - tip_position, axis=1))
     )
-    contact_proxy = max(
-        0.0,
-        (LESION_CONTACT_RADIUS - min_contact_distance) / max(LESION_CONTACT_RADIUS, 1e-8),
-    )
-    contact_proxy = float(min(contact_proxy, 1.0))
-
     return {
         "lesion_distance": lesion_distance,
         "lesion_strain": float(lesion_avg_strain),
         "tissue_strain": float(tissue_avg_strain),
         "contact_distance": min_contact_distance,
-        "contact_proxy": contact_proxy,
         "lesion_center": lesion_center.tolist(),
     }
+
+
+def extract_topology_cells(grid_component):
+    topo_val = grid_component.hexahedra.value
+    cell_type = "hexahedron"
+    if len(topo_val) == 0:
+        topo_val = grid_component.tetrahedra.value
+        cell_type = "tetra"
+    if len(topo_val) == 0:
+        topo_val = grid_component.triangles.value
+        cell_type = "triangle"
+    if len(topo_val) == 0:
+        topo_val = grid_component.getData("tetrahedra").value
+        cell_type = "tetra"
+    if len(topo_val) == 0:
+        return None
+    return [(cell_type, np.array(topo_val))]
+
+
+def compute_contact_force_stats(constraint_forces, baseline_force_level, contact_distance):
+    if constraint_forces is None:
+        return 0.0, 0.0, 0.0
+    force_array = np.asarray(constraint_forces, dtype=np.float64).reshape(-1)
+    if force_array.size == 0:
+        return 0.0, 0.0, 0.0
+
+    abs_force = np.abs(force_array)
+    force_mean = float(np.mean(abs_force))
+    force_peak = float(np.max(abs_force))
+    force_total = float(np.sum(abs_force))
+
+    force_mean = max(0.0, force_mean - baseline_force_level[0])
+    force_peak = max(0.0, force_peak - baseline_force_level[1])
+    force_total = max(0.0, force_total - baseline_force_level[2])
+
+    if contact_distance > CONTACT_FORCE_DISTANCE_GATE:
+        # 距离较远时将约束力视作非接触力（例如固定约束或数值噪声）
+        return 0.0, 0.0, 0.0
+    return force_mean, force_peak, force_total
+
+
+def read_constraint_forces(constraint_solver):
+    try:
+        raw_values = constraint_solver.constraintForces.value
+    except Exception:
+        return np.array([], dtype=np.float64)
+    return np.asarray(raw_values, dtype=np.float64).reshape(-1)
 
 def main():
     root = Sofa.Core.Node("root")
@@ -202,31 +252,13 @@ def main():
     print("正在激活网格拓扑...")
     Sofa.Simulation.animate(root, 0.0001) 
 
-    # 3. 获取组件引用并提取拓扑
-    grid_component = root.SoftBody.grid
-    
-    # 优先尝试 hexa 数据，确保与当前 FEM 力场一致
-    topo_val = grid_component.hexahedra.value
-    cell_type = "hexahedron"
-
-    # 备选导出单元：tetra / triangle
-    if len(topo_val) == 0:
-        topo_val = grid_component.tetrahedra.value
-        cell_type = "tetra"
-    if len(topo_val) == 0:
-        topo_val = grid_component.triangles.value
-        cell_type = "triangle"
-
-    if len(topo_val) == 0:
-        # 如果还是空，尝试直接从 Data 字段强制读取
-        topo_val = grid_component.getData("tetrahedra").value
-        if len(topo_val) == 0:
-            print("[Error] 无法获取拓扑数据！请检查 createScene 中的 nx, ny, nz 是否都 >= 2")
-            return
-
-    # 封装给 meshio 使用
-    topo_cells = [(cell_type, np.array(topo_val))]
-    print(f"成功获取拓扑！类型: {cell_type}, 数量: {len(topo_val)}")
+    robot_topo_cells = extract_topology_cells(root.SoftBody.grid)
+    tissue_topo_cells = extract_topology_cells(root.TargetTissue.grid)
+    if robot_topo_cells is None or tissue_topo_cells is None:
+        print("[Error] 无法获取机器人或组织拓扑数据，请检查网格参数配置。")
+        return
+    print(f"Robot topology: {robot_topo_cells[0][0]}, count={len(robot_topo_cells[0][1])}")
+    print(f"Tissue topology: {tissue_topo_cells[0][0]}, count={len(tissue_topo_cells[0][1])}")
 
     cable = root.SoftBody.cable
     robot_dofs = root.SoftBody.dofs
@@ -242,12 +274,16 @@ def main():
         lesion_radius=0.025,
     )
     print(f"Lesion region nodes: {len(lesion_indices)}")
+    baseline_force_level = (0.0, 0.0, 0.0)
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
     sock.bind("tcp://*:5555")
     
-    if not os.path.exists('vtk_output'): os.makedirs('vtk_output')
+    robot_vtk_dir = os.path.join("vtk_output", "robot")
+    tissue_vtk_dir = os.path.join("vtk_output", "tissue")
+    os.makedirs(robot_vtk_dir, exist_ok=True)
+    os.makedirs(tissue_vtk_dir, exist_ok=True)
     print("[SOFA] Headless Server Ready (Manual Export Mode)...")
     export_interval = max(1, int(os.environ.get("SOFA_EXPORT_INTERVAL", str(DEFAULT_EXPORT_INTERVAL))))
     print(f"[SOFA] Export interval: every {export_interval} steps")
@@ -269,6 +305,16 @@ def main():
                 robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
                 tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
                 rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
+                solver_forces = read_constraint_forces(root.constraint_solver)
+                if solver_forces.size > 0:
+                    abs_solver_forces = np.abs(solver_forces)
+                    baseline_force_level = (
+                        float(np.mean(abs_solver_forces)),
+                        float(np.max(abs_solver_forces)),
+                        float(np.sum(abs_solver_forces)),
+                    )
+                else:
+                    baseline_force_level = (0.0, 0.0, 0.0)
             else:
                 # 执行一步控制
                 raw_cable_disp = float(cmd.get("cable_disp", 0.0))
@@ -282,15 +328,16 @@ def main():
             # 周期导出 VTK 供 ParaView / GIF 可视化
             if step_count % export_interval == 0:
                 try:
-                    target_dir = 'vtk_output'
-                    if not os.path.exists(target_dir):
-                        os.makedirs(target_dir)
-                    
-                    points = np.array(robot_dofs.position.value)
-                    if len(points) > 0 and len(topo_cells) > 0:
-                        mesh = meshio.Mesh(points=points, cells=topo_cells)
-                        vtk_file = os.path.join(target_dir, f"frame_{step_count:04d}.vtk")
-                        mesh.write(vtk_file)
+                    robot_points = np.array(robot_dofs.position.value)
+                    tissue_points = np.array(tissue_dofs.position.value)
+                    if len(robot_points) > 0:
+                        robot_mesh = meshio.Mesh(points=robot_points, cells=robot_topo_cells)
+                        robot_file = os.path.join(robot_vtk_dir, f"frame_{step_count:04d}.vtk")
+                        robot_mesh.write(robot_file)
+                    if len(tissue_points) > 0:
+                        tissue_mesh = meshio.Mesh(points=tissue_points, cells=tissue_topo_cells)
+                        tissue_file = os.path.join(tissue_vtk_dir, f"frame_{step_count:04d}.vtk")
+                        tissue_mesh.write(tissue_file)
                 except Exception as e:
                     print(f"VTK Export Error: {e}")
 
@@ -306,7 +353,6 @@ def main():
                     "lesion_strain": 0.0,
                     "tissue_strain": 0.0,
                     "contact_distance": 1.0,
-                    "contact_proxy": 0.0,
                     "lesion_center": [0.0, 0.0, 0.0],
                 }
             else:
@@ -324,8 +370,16 @@ def main():
                     tissue_rest_positions=tissue_rest_positions,
                     lesion_indices=lesion_indices,
                 )
+            contact_force_mean, contact_force_peak, contact_force_total = compute_contact_force_stats(
+                constraint_forces=read_constraint_forces(root.constraint_solver),
+                baseline_force_level=baseline_force_level,
+                contact_distance=lesion_metrics["contact_distance"],
+            )
             if len(robot_positions) == 0:
                 tip_displacement = 0.0
+                contact_force_mean = 0.0
+                contact_force_peak = 0.0
+                contact_force_total = 0.0
 
             reply = {
                 "step": step_count,
@@ -337,7 +391,9 @@ def main():
                 "lesion_strain": lesion_metrics["lesion_strain"],
                 "tissue_strain": lesion_metrics["tissue_strain"],
                 "contact_distance": lesion_metrics["contact_distance"],
-                "contact_proxy": lesion_metrics["contact_proxy"],
+                "contact_force_mean": contact_force_mean,
+                "contact_force_peak": contact_force_peak,
+                "contact_force_total": contact_force_total,
                 "lesion_center": lesion_metrics["lesion_center"],
             }
             sock.send_string(json.dumps(reply))

@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-INPUT_GLOB="${INPUT_GLOB:-sofa/vtk_output/frame_*.vtk}"
+ROBOT_GLOB="${ROBOT_GLOB:-${INPUT_GLOB:-sofa/vtk_output/robot/frame_*.vtk}}"
+TISSUE_GLOB="${TISSUE_GLOB:-sofa/vtk_output/tissue/frame_*.vtk}"
 OUTPUT_GIF="${OUTPUT_GIF:-logs/sofa_demo.gif}"
 FRAME_STRIDE="${FRAME_STRIDE:-10}"
 FPS="${FPS:-12}"
@@ -30,7 +31,9 @@ Examples:
   scripts/make_demo_gif.sh logs/demo.gif 25 15
 
 Environment overrides:
-  INPUT_GLOB   Default: sofa/vtk_output/frame_*.vtk
+  ROBOT_GLOB   Default: sofa/vtk_output/robot/frame_*.vtk
+  TISSUE_GLOB  Default: sofa/vtk_output/tissue/frame_*.vtk
+  INPUT_GLOB   Backward-compatible alias of ROBOT_GLOB
   OUTPUT_GIF   Default: logs/sofa_demo.gif
   FRAME_STRIDE Default: 10
   FPS          Default: 12
@@ -87,7 +90,7 @@ ensure_package meshio meshio
 ensure_package matplotlib matplotlib
 ensure_package PIL pillow
 
-export INPUT_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE ELEVATION AZIMUTH
+export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE ELEVATION AZIMUTH
 
 "$PYTHON_BIN" - <<'PY'
 import glob
@@ -98,7 +101,8 @@ import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-input_glob = os.environ["INPUT_GLOB"]
+robot_glob = os.environ["ROBOT_GLOB"]
+tissue_glob = os.environ["TISSUE_GLOB"]
 output_gif = os.environ["OUTPUT_GIF"]
 frame_stride = int(os.environ["FRAME_STRIDE"])
 fps = int(os.environ["FPS"])
@@ -107,27 +111,42 @@ motion_scale = float(os.environ["MOTION_SCALE"])
 elevation = float(os.environ["ELEVATION"])
 azimuth = float(os.environ["AZIMUTH"])
 
-all_files = sorted(glob.glob(input_glob))
-if not all_files:
-    raise SystemExit(f"[ERROR] No VTK frames found with pattern: {input_glob}")
+robot_files = sorted(glob.glob(robot_glob))
+if not robot_files:
+    raise SystemExit(f"[ERROR] No robot VTK frames found with pattern: {robot_glob}")
+tissue_files = sorted(glob.glob(tissue_glob))
 
-selected_files = all_files[::frame_stride]
-if len(selected_files) < 2 and len(all_files) > 1:
-    selected_files = [all_files[0], all_files[-1]]
+selected_robot_files = robot_files[::frame_stride]
+if len(selected_robot_files) < 2 and len(robot_files) > 1:
+    selected_robot_files = [robot_files[0], robot_files[-1]]
 
-point_clouds = []
+selected_tissue_files = tissue_files[::frame_stride] if tissue_files else []
+if len(selected_tissue_files) < 2 and len(tissue_files) > 1:
+    selected_tissue_files = [tissue_files[0], tissue_files[-1]]
+
+robot_point_clouds = []
+tissue_point_clouds = []
 mins = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
 maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
-for path in selected_files:
+for path in selected_robot_files:
     mesh = meshio.read(path)
     points = np.asarray(mesh.points, dtype=np.float64)
     if points.size == 0:
         continue
-    point_clouds.append((path, points))
+    robot_point_clouds.append((path, points))
     mins = np.minimum(mins, points.min(axis=0))
     maxs = np.maximum(maxs, points.max(axis=0))
 
-if len(point_clouds) < 2:
+for path in selected_tissue_files:
+    mesh = meshio.read(path)
+    points = np.asarray(mesh.points, dtype=np.float64)
+    if points.size == 0:
+        continue
+    tissue_point_clouds.append((path, points))
+    mins = np.minimum(mins, points.min(axis=0))
+    maxs = np.maximum(maxs, points.max(axis=0))
+
+if len(robot_point_clouds) < 2:
     raise SystemExit("[ERROR] Need at least 2 non-empty VTK frames to render GIF.")
 
 margin = 0.05 * np.maximum(maxs - mins, 1e-6)
@@ -144,17 +163,32 @@ ax.set_ylim(mins[1], maxs[1])
 ax.set_zlim(mins[2], maxs[2])
 ax.set_box_aspect((maxs - mins).tolist())
 
-first_points = point_clouds[0][1]
-colors = np.linspace(0.0, 1.0, first_points.shape[0])
-scatter = ax.scatter(
-    first_points[:, 0],
-    first_points[:, 1],
-    first_points[:, 2],
-    c=colors,
+first_robot_points = robot_point_clouds[0][1]
+robot_colors = np.linspace(0.0, 1.0, first_robot_points.shape[0])
+robot_scatter = ax.scatter(
+    first_robot_points[:, 0],
+    first_robot_points[:, 1],
+    first_robot_points[:, 2],
+    c=robot_colors,
     cmap="viridis",
     s=point_size,
     alpha=0.85,
+    label="Robot",
 )
+tissue_scatter = None
+first_tissue_points = None
+if tissue_point_clouds:
+    first_tissue_points = tissue_point_clouds[0][1]
+    tissue_scatter = ax.scatter(
+        first_tissue_points[:, 0],
+        first_tissue_points[:, 1],
+        first_tissue_points[:, 2],
+        c="salmon",
+        s=max(1.0, point_size * 0.45),
+        alpha=0.35,
+        label="Target tissue",
+    )
+ax.legend(loc="upper right")
 ax.view_init(elev=elevation, azim=azimuth)
 
 if motion_scale <= 0:
@@ -163,21 +197,42 @@ if motion_scale <= 0:
 def scaled_points(points):
     if motion_scale == 1.0:
         return points
-    return first_points + motion_scale * (points - first_points)
+    return first_robot_points + motion_scale * (points - first_robot_points)
+
+
+def scaled_tissue_points(points):
+    if motion_scale == 1.0 or first_tissue_points is None:
+        return points
+    return first_tissue_points + motion_scale * (points - first_tissue_points)
 
 def update(frame_idx):
-    _path, points = point_clouds[frame_idx]
-    render_points = scaled_points(points)
-    scatter._offsets3d = (render_points[:, 0], render_points[:, 1], render_points[:, 2])
-    ax.set_title(
-        f"SOFA deformation demo ({frame_idx + 1}/{len(point_clouds)}) | motion_scale={motion_scale:.2f}"
+    _path, robot_points = robot_point_clouds[frame_idx]
+    render_robot_points = scaled_points(robot_points)
+    robot_scatter._offsets3d = (
+        render_robot_points[:, 0],
+        render_robot_points[:, 1],
+        render_robot_points[:, 2],
     )
-    return (scatter,)
+    artists = [robot_scatter]
+
+    if tissue_scatter is not None and frame_idx < len(tissue_point_clouds):
+        _, tissue_points = tissue_point_clouds[frame_idx]
+        render_tissue_points = scaled_tissue_points(tissue_points)
+        tissue_scatter._offsets3d = (
+            render_tissue_points[:, 0],
+            render_tissue_points[:, 1],
+            render_tissue_points[:, 2],
+        )
+        artists.append(tissue_scatter)
+    ax.set_title(
+        f"SOFA deformation demo ({frame_idx + 1}/{len(robot_point_clouds)}) | motion_scale={motion_scale:.2f}"
+    )
+    return tuple(artists)
 
 ani = FuncAnimation(
     fig,
     update,
-    frames=len(point_clouds),
+    frames=len(robot_point_clouds),
     interval=1000 / fps,
     blit=False,
 )
@@ -186,11 +241,14 @@ ani.save(output_gif, writer=writer)
 plt.close(fig)
 
 tip_displacements = [
-    float(np.linalg.norm(points[-1] - first_points[-1]))
-    for _, points in point_clouds
+    float(np.linalg.norm(points[-1] - first_robot_points[-1]))
+    for _, points in robot_point_clouds
 ]
 print(f"[OK] Saved GIF: {output_gif}")
-print(f"[INFO] Input frames: {len(all_files)}, rendered frames: {len(point_clouds)}, stride: {frame_stride}")
+print(
+    f"[INFO] Robot frames: {len(robot_files)} -> rendered {len(robot_point_clouds)}; "
+    f"Tissue frames: {len(tissue_files)} -> rendered {len(tissue_point_clouds)}; stride={frame_stride}"
+)
 print(
     "[INFO] Tip displacement stats (raw meters): "
     f"min={min(tip_displacements):.6f}, max={max(tip_displacements):.6f}, "

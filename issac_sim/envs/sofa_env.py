@@ -17,6 +17,8 @@ class SoftSofaEnv(gym.Env):
         self.max_avg_strain = 0.45
         self.max_tissue_strain = 0.25
         self.max_lesion_strain = 0.20
+        self.max_contact_force = 2.0
+        self.min_contact_force = 0.01
         self.success_distance = 0.01
 
         # 1. 定义动作空间 (Action Space)
@@ -33,7 +35,9 @@ class SoftSofaEnv(gym.Env):
             "lesion_strain": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "tissue_strain": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "contact_distance": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
-            "contact_proxy": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            "contact_force_mean": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "contact_force_peak": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "contact_force_total": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "lesion_center": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
         })
         self._last_obs = self._build_obs(self._default_sofa_obs())
@@ -73,7 +77,7 @@ class SoftSofaEnv(gym.Env):
                 "lesion_strain": float(self._last_obs["lesion_strain"][0]),
                 "tissue_strain": float(self._last_obs["tissue_strain"][0]),
                 "lesion_distance": float(self._last_obs["lesion_distance"][0]),
-                "contact_proxy": float(self._last_obs["contact_proxy"][0]),
+                "contact_force_peak": float(self._last_obs["contact_force_peak"][0]),
                 "success": False,
             }
             return self._last_obs, -100.0, True, False, info
@@ -93,7 +97,9 @@ class SoftSofaEnv(gym.Env):
             "lesion_strain": float(obs["lesion_strain"][0]),
             "tissue_strain": float(obs["tissue_strain"][0]),
             "lesion_distance": float(obs["lesion_distance"][0]),
-            "contact_proxy": float(obs["contact_proxy"][0]),
+            "contact_force_mean": float(obs["contact_force_mean"][0]),
+            "contact_force_peak": float(obs["contact_force_peak"][0]),
+            "contact_force_total": float(obs["contact_force_total"][0]),
             "success": success,
             "tip_displacement": float(sofa_obs.get("tip_displacement", 0.0)),
             "communication_error": False,
@@ -123,22 +129,25 @@ class SoftSofaEnv(gym.Env):
             "lesion_strain": np.array([float(sofa_obs.get("lesion_strain", 0.0))], dtype=np.float32),
             "tissue_strain": np.array([float(sofa_obs.get("tissue_strain", 0.0))], dtype=np.float32),
             "contact_distance": np.array([float(sofa_obs.get("contact_distance", 1.0))], dtype=np.float32),
-            "contact_proxy": np.array([float(sofa_obs.get("contact_proxy", 0.0))], dtype=np.float32),
+            "contact_force_mean": np.array([float(sofa_obs.get("contact_force_mean", 0.0))], dtype=np.float32),
+            "contact_force_peak": np.array([float(sofa_obs.get("contact_force_peak", 0.0))], dtype=np.float32),
+            "contact_force_total": np.array([float(sofa_obs.get("contact_force_total", 0.0))], dtype=np.float32),
             "lesion_center": lesion_center,
         }
 
     def _compute_reward(self, obs):
         lesion_distance = float(obs["lesion_distance"][0])
         task_term = -lesion_distance
-        # 靠近病灶后再鼓励温和接触，避免远距离盲目压迫
-        contact_term = 0.4 * float(obs["contact_proxy"][0]) * np.exp(-3.0 * lesion_distance)
+        contact_force_peak = float(obs["contact_force_peak"][0])
+        # 靠近病灶后再鼓励真实接触约束力，但避免过大接触力
+        contact_term = 0.3 * np.tanh(contact_force_peak) * np.exp(-3.0 * lesion_distance)
         safety_penalty = (
             0.06 * float(obs["von_mises"][0])
             + 0.08 * float(obs["avg_strain"][0])
             + 0.18 * float(obs["tissue_strain"][0])
             + 0.22 * float(obs["lesion_strain"][0])
         )
-        excessive_contact_penalty = 0.2 * max(float(obs["contact_proxy"][0]) - 0.7, 0.0) ** 2
+        excessive_contact_penalty = 0.35 * max(contact_force_peak - self.max_contact_force, 0.0) ** 2
         success_bonus = 5.0 if self._is_success(obs) else 0.0
         return task_term + contact_term - safety_penalty - excessive_contact_penalty + success_bonus
 
@@ -148,12 +157,13 @@ class SoftSofaEnv(gym.Env):
             or obs["avg_strain"][0] > self.max_avg_strain
             or obs["tissue_strain"][0] > self.max_tissue_strain
             or obs["lesion_strain"][0] > self.max_lesion_strain
+            or obs["contact_force_peak"][0] > 2.5 * self.max_contact_force
         )
 
     def _is_success(self, obs):
         return bool(
             obs["lesion_distance"][0] < self.success_distance
-            and obs["contact_proxy"][0] > 0.2
+            and self.min_contact_force < obs["contact_force_peak"][0] < self.max_contact_force
         )
 
     def _default_sofa_obs(self):
@@ -165,7 +175,9 @@ class SoftSofaEnv(gym.Env):
             "lesion_strain": 0.0,
             "tissue_strain": 0.0,
             "contact_distance": 1.0,
-            "contact_proxy": 0.0,
+            "contact_force_mean": 0.0,
+            "contact_force_peak": 0.0,
+            "contact_force_total": 0.0,
             "lesion_center": [0.0, 0.0, 0.0],
         }
 
@@ -180,7 +192,9 @@ class SoftSofaEnv(gym.Env):
             "lesion_strain",
             "tissue_strain",
             "contact_distance",
-            "contact_proxy",
+            "contact_force_mean",
+            "contact_force_peak",
+            "contact_force_total",
             "lesion_center",
         )
         return all(key in sofa_obs for key in required_keys)
