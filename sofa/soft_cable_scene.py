@@ -25,6 +25,11 @@ ROBOT_POISSON_RATIO = 0.45
 # 组织材料参数（更软）
 TISSUE_YOUNG_MODULUS = 1200.0
 TISSUE_POISSON_RATIO = 0.46
+# 分段常曲率（PCC）机器人参数
+PCC_SEGMENT_LENGTHS = [0.25, 0.25, 0.25, 0.25]
+PCC_SEGMENT_WEIGHTS = [1.00, 0.85, 0.70, 0.55]
+PCC_POINTS_PER_SEGMENT = 8
+PCC_MAX_CURVATURE = 4.0  # 1/m
 # 缆绳控制参数：限制绝对位移，避免数值发散
 CABLE_DISP_LIMIT = 1.5
 CABLE_DISP_SCALE = 1.0
@@ -32,6 +37,41 @@ CABLE_DISP_SCALE = 1.0
 DEFAULT_EXPORT_INTERVAL = 10
 # 力统计距离门限：距离大于该值时视作“非接触”
 CONTACT_FORCE_DISTANCE_GATE = 0.004
+
+
+def build_line_edges(point_count):
+    if point_count <= 1:
+        return np.zeros((0, 2), dtype=np.int32)
+    start_idx = np.arange(0, point_count - 1, dtype=np.int32)
+    end_idx = np.arange(1, point_count, dtype=np.int32)
+    return np.stack([start_idx, end_idx], axis=1)
+
+
+def generate_segmented_constant_curvature_points(curvature_command):
+    """
+    生成固定基端的分段常曲率（PCC）中心线。
+
+    Args:
+        curvature_command: 全局控制曲率（标量），每段按权重缩放后保持常数。
+
+    Returns:
+        np.ndarray: (N, 3) 机器人中心线点集
+    """
+    kappa = float(np.clip(curvature_command, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE))
+    points = [np.array([0.0, 0.0, 0.0], dtype=np.float64)]
+    theta = 0.0
+    current = points[0].copy()
+
+    for seg_len, seg_weight in zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS):
+        seg_kappa = kappa * seg_weight
+        ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
+        for _ in range(PCC_POINTS_PER_SEGMENT):
+            theta += seg_kappa * ds
+            # 平面常曲率：弯曲发生在 X-Z 平面
+            current[0] += np.sin(theta) * ds
+            current[2] += np.cos(theta) * ds
+            points.append(current.copy())
+    return np.asarray(points, dtype=np.float64)
 
 def createScene(root):
     """
@@ -67,54 +107,16 @@ def createScene(root):
         responseParams="mu=0.2",
     )
 
-    # 1) 连续体机器人节点
+    # 1) 连续体机器人节点（分段常曲率 PCC 模型）
     soft = root.addChild("SoftBody")
-    # 隐式积分 + 共轭梯度线性求解器（稳定性更好）
-    soft.addObject("EulerImplicitSolver")
-    soft.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
-    
-    # 机器人体网格：
-    # min/max 控制几何包围盒，nx/ny/nz 控制网格分辨率
-    soft.addObject('RegularGridTopology', name='grid', 
-                   min=[0, 0, 0], max=[0.1, 0.1, 1.0], 
-                   nx=3, ny=3, nz=10)
-    
-    # 状态量容器
-    soft.addObject("MechanicalObject", name="dofs", template="Vec3d")
-    
-    # RegularGridTopology 生成 hexa 网格，故使用 HexahedronFEMForceField
-    # method="large" 允许较大形变
-    soft.addObject(
-        "HexahedronFEMForceField",
-        name="fem",
-        topology="@grid",
-        method="large",
-        youngModulus=ROBOT_YOUNG_MODULUS,
-        poissonRatio=ROBOT_POISSON_RATIO,
-    )
-    
-    soft.addObject("UniformMass", totalMass=0.5)
-    soft.addObject("PointCollisionModel", name="collision", group=1)
-    # 固定机器人基座，避免整体刚体漂移导致“看起来没有弯曲运动”
-    soft.addObject(
-        "BoxROI",
-        name="base_roi",
-        box=[-0.001, -0.001, -0.001, 0.101, 0.101, 0.08],
-        drawBoxes=False,
-    )
-    soft.addObject("FixedConstraint", indices="@base_roi.indices")
-
-    # 缆绳约束：索引需在网格点数范围内
-    # valueType="displacement" 表示直接控制位移，不是力控制
-    # pullPoint 定义牵引参考点
-    soft.addObject(
-        "CableConstraint",
-        name="cable",
-        indices=[0, 9, 18, 27, 36, 45, 54, 63, 72, 81], 
-        value=[0.0],
-        valueType="displacement",
-        pullPoint=[0, 0, -0.1]
-    )
+    pcc_points = generate_segmented_constant_curvature_points(curvature_command=0.0)
+    pcc_edges = build_line_edges(point_count=len(pcc_points))
+    soft.addObject("EdgeSetTopologyContainer", name="line_topology", edges=pcc_edges.tolist())
+    # 机器人机械状态：由控制器每步按 PCC 更新位置（固定基端）
+    soft.addObject("MechanicalObject", name="dofs", template="Vec3d", position=pcc_points.tolist())
+    # 同时启用点碰撞和线碰撞，增强细长体接触稳定性
+    soft.addObject("PointCollisionModel", name="collision_points", group=1)
+    soft.addObject("LineCollisionModel", name="collision_lines", group=1)
 
     # 2) 目标组织节点（包含病灶区域）
     tissue = root.addChild("TargetTissue")
@@ -314,6 +316,22 @@ def read_constraint_forces(constraint_solver):
         return np.array([], dtype=np.float64)
     return np.asarray(raw_values, dtype=np.float64).reshape(-1)
 
+
+def apply_robot_pcc_shape(robot_dofs, curvature_command):
+    """
+    按分段常曲率模型更新机器人中心线点位（固定基端）。
+
+    Args:
+        robot_dofs: SOFA MechanicalObject
+        curvature_command: 目标曲率控制量
+
+    Returns:
+        np.ndarray: 更新后的中心线点集
+    """
+    points = generate_segmented_constant_curvature_points(curvature_command=curvature_command)
+    robot_dofs.position.value = points.tolist()
+    return points
+
 def main():
     """SOFA headless 服务主循环。"""
     root = Sofa.Core.Node("root")
@@ -328,7 +346,8 @@ def main():
     Sofa.Simulation.animate(root, 0.0001) 
 
     # 提取机器人和组织拓扑，供 VTK 导出
-    robot_topo_cells = extract_topology_cells(root.SoftBody.grid)
+    robot_edges = np.asarray(root.SoftBody.line_topology.edges.value, dtype=np.int32)
+    robot_topo_cells = [("line", robot_edges)] if robot_edges.size > 0 else None
     tissue_topo_cells = extract_topology_cells(root.TargetTissue.grid)
     if robot_topo_cells is None or tissue_topo_cells is None:
         print("[Error] 无法获取机器人或组织拓扑数据，请检查网格参数配置。")
@@ -336,11 +355,11 @@ def main():
     print(f"Robot topology: {robot_topo_cells[0][0]}, count={len(robot_topo_cells[0][1])}")
     print(f"Tissue topology: {tissue_topo_cells[0][0]}, count={len(tissue_topo_cells[0][1])}")
 
-    cable = root.SoftBody.cable
     robot_dofs = root.SoftBody.dofs
     tissue_dofs = root.TargetTissue.dofs
+    current_curvature_cmd = 0.0
 
-    robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
+    robot_rest_positions = apply_robot_pcc_shape(robot_dofs, curvature_command=0.0)
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
     rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
     # 病灶初始中心（可作为任务配置参数暴露给上层）
@@ -379,10 +398,10 @@ def main():
                 # reset：重置场景、控制量与参考状态，用于 episode 开始
                 Sofa.Simulation.reset(root)
                 step_count = 0
-                cable.value = [0.0]
+                current_curvature_cmd = 0.0
+                robot_rest_positions = apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
                 # reset 后推进一个小步以刷新位置缓存
                 Sofa.Simulation.animate(root, 0.0001)
-                robot_rest_positions = np.array(robot_dofs.position.value, copy=True)
                 tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
                 rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
                 # 记录 reset 基线约束力，用于运行时剔除静态约束背景噪声
@@ -400,8 +419,10 @@ def main():
                 # 执行一步控制
                 raw_cable_disp = float(cmd.get("cable_disp", 0.0))
                 # 动作缩放+限幅，防止超大控制导致数值问题
-                cable_disp = float(np.clip(raw_cable_disp * CABLE_DISP_SCALE, -CABLE_DISP_LIMIT, CABLE_DISP_LIMIT))
-                cable.value = [cable_disp]
+                current_curvature_cmd = float(
+                    np.clip(raw_cable_disp * CABLE_DISP_SCALE, -CABLE_DISP_LIMIT, CABLE_DISP_LIMIT)
+                )
+                apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
                 
                 # 物理步进
                 Sofa.Simulation.animate(root, float(root.dt.value))
