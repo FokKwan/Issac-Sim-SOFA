@@ -40,7 +40,6 @@ def createScene(root):
     soft = root.addChild("SoftBody")
     soft.addObject("EulerImplicitSolver")
     soft.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
-    soft.addObject("LinearSolverConstraintCorrection")
     
     # 使用 RegularGridTopology 自动生成 3x3x10 的网格 (共90个点)
     soft.addObject('RegularGridTopology', name='grid', 
@@ -85,7 +84,6 @@ def createScene(root):
     tissue = root.addChild("TargetTissue")
     tissue.addObject("EulerImplicitSolver")
     tissue.addObject("CGLinearSolver", iterations=200, tolerance=1e-9, threshold=1e-9)
-    tissue.addObject("LinearSolverConstraintCorrection")
     tissue.addObject(
         "RegularGridTopology",
         name="grid",
