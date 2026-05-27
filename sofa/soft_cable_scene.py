@@ -30,6 +30,8 @@ PCC_SEGMENT_LENGTHS = [0.25, 0.25, 0.25, 0.25]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.85, 0.70, 0.55]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 4.0  # 1/m
+# 机器人基座初始偏移（确保初始不与组织接触）
+PCC_BASE_OFFSET = np.array([-0.12, 0.0, 0.0], dtype=np.float64)
 # 缆绳控制参数：限制绝对位移，避免数值发散
 CABLE_DISP_LIMIT = 1.5
 CABLE_DISP_SCALE = 1.0
@@ -58,7 +60,7 @@ def generate_segmented_constant_curvature_points(curvature_command):
         np.ndarray: (N, 3) 机器人中心线点集
     """
     kappa = float(np.clip(curvature_command, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE))
-    points = [np.array([0.0, 0.0, 0.0], dtype=np.float64)]
+    points = [PCC_BASE_OFFSET.copy()]
     theta = 0.0
     current = points[0].copy()
 
