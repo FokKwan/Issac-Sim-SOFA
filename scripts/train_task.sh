@@ -20,7 +20,9 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 SOFA_CONDA_ENV="${SOFA_CONDA_ENV:-sofa_rl}"
 SOFA_PYTHON_BIN="${SOFA_PYTHON_BIN:-python}"
 TRAIN_PYTHON_BIN="${TRAIN_PYTHON_BIN:-}"
-TRAIN_ENTRY="${TRAIN_ENTRY:-issac_sim/run_env.py}"
+TRAIN_ENTRY="${TRAIN_ENTRY:-issac_sim.run_env}"
+TRAIN_ENTRY_MODE="${TRAIN_ENTRY_MODE:-module}"
+TRAIN_STRIP_CONDA="${TRAIN_STRIP_CONDA:-1}"
 CONDA_BASE="${CONDA_BASE:-}"
 
 if [[ -x "$VENV_PATH/bin/python" ]]; then
@@ -53,7 +55,9 @@ Environment variables:
   SOFA_CONDA_ENV  Conda env for SOFA server (default: sofa_rl, empty disables conda activation)
   SOFA_PYTHON_BIN Python executable inside SOFA env (default: python)
   TRAIN_PYTHON_BIN Python executable for RL training (default: ~/omniverse/python.sh if exists)
-  TRAIN_ENTRY      Training entry script/module argument (default: issac_sim/run_env.py)
+  TRAIN_ENTRY      Training entry (default: issac_sim.run_env)
+  TRAIN_ENTRY_MODE module|script (default: module)
+  TRAIN_STRIP_CONDA 1 to unset conda vars before train launch (default: 1)
   CONDA_BASE       Conda base path override (e.g. ~/miniconda3)
   SOFA_SESSION tmux session name for SOFA (default: sofa-server)
   TRAIN_SESSION tmux session name for training (default: rl-train)
@@ -104,7 +108,19 @@ build_sofa_command() {
 }
 
 build_train_command() {
-  printf "%s" "cd \"$REPO_ROOT\" && \"$TRAIN_PYTHON_BIN\" \"$TRAIN_ENTRY\" --total-timesteps \"$TIMESTEPS\" --eval-steps \"$EVAL_STEPS\" 2>&1 | tee \"$TRAIN_LOG\""
+  local preamble="cd \"$REPO_ROOT\" && "
+  if [[ "$TRAIN_STRIP_CONDA" == "1" ]]; then
+    preamble+="unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL PYTHONHOME && "
+  fi
+
+  if [[ "$TRAIN_ENTRY_MODE" == "module" ]]; then
+    printf "%s" "${preamble}\"$TRAIN_PYTHON_BIN\" -m \"$TRAIN_ENTRY\" --total-timesteps \"$TIMESTEPS\" --eval-steps \"$EVAL_STEPS\" 2>&1 | tee \"$TRAIN_LOG\""
+  elif [[ "$TRAIN_ENTRY_MODE" == "script" ]]; then
+    printf "%s" "${preamble}\"$TRAIN_PYTHON_BIN\" \"$TRAIN_ENTRY\" --total-timesteps \"$TIMESTEPS\" --eval-steps \"$EVAL_STEPS\" 2>&1 | tee \"$TRAIN_LOG\""
+  else
+    echo "[ERROR] TRAIN_ENTRY_MODE must be 'module' or 'script', got: $TRAIN_ENTRY_MODE" >&2
+    return 1
+  fi
 }
 
 ensure_session_alive_or_fail() {
@@ -165,6 +181,8 @@ show_status() {
   echo "SOFA python: $SOFA_PYTHON_BIN"
   echo "TRAIN python: $TRAIN_PYTHON_BIN"
   echo "TRAIN entry: $TRAIN_ENTRY"
+  echo "TRAIN entry mode: $TRAIN_ENTRY_MODE"
+  echo "TRAIN strip conda: $TRAIN_STRIP_CONDA"
   echo "SOFA session ($SOFA_SESSION): $(has_session "$SOFA_SESSION" && echo running || echo stopped)"
   echo "TRAIN session ($TRAIN_SESSION): $(has_session "$TRAIN_SESSION" && echo running || echo stopped)"
   echo "Logs:"
