@@ -31,7 +31,8 @@ PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 6.0  # 1/m，允许更大幅度弯曲
 # 机器人基座初始偏移（右侧固定，主轴沿 x 方向）
-PCC_BASE_OFFSET = np.array([0.45, 0.03, 0.0], dtype=np.float64)
+# 经 PCC 工作空间校核：该基座使 κ≈-5.7 时末端可达病灶 (0.08, -0.12)
+PCC_BASE_OFFSET = np.array([0.10, -0.08, 0.0], dtype=np.float64)
 # 缆绳控制参数：每步曲率增量（累积控制，更接近真实缆绳拉动）
 CURVATURE_DELTA_SCALE = 0.55
 CURVATURE_DELTA_LIMIT = 0.65
