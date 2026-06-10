@@ -95,6 +95,7 @@ export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCAL
 "$PYTHON_BIN" - <<'PY'
 import glob
 import os
+import re
 
 import meshio
 import numpy as np
@@ -111,43 +112,108 @@ motion_scale = float(os.environ["MOTION_SCALE"])
 elevation = float(os.environ["ELEVATION"])
 azimuth = float(os.environ["AZIMUTH"])
 
+
+def frame_id(path):
+    match = re.search(r"frame_(\d+)", os.path.basename(path))
+    return int(match.group(1)) if match else -1
+
+
+def index_by_frame_id(paths):
+    indexed = {}
+    for path in sorted(paths):
+        step = frame_id(path)
+        if step >= 0:
+            indexed[step] = path
+    return indexed
+
+
+def load_points(path):
+    mesh = meshio.read(path)
+    return np.asarray(mesh.points, dtype=np.float64)
+
+
+def dominant_point_count(point_clouds):
+    if not point_clouds:
+        return None
+    counts = {}
+    for _path, points in point_clouds:
+        key = int(points.shape[0])
+        counts[key] = counts.get(key, 0) + 1
+    return max(counts, key=counts.get)
+
+
 robot_files = sorted(glob.glob(robot_glob))
 if not robot_files:
     raise SystemExit(f"[ERROR] No robot VTK frames found with pattern: {robot_glob}")
 tissue_files = sorted(glob.glob(tissue_glob))
 
-selected_robot_files = robot_files[::frame_stride]
-if len(selected_robot_files) < 2 and len(robot_files) > 1:
-    selected_robot_files = [robot_files[0], robot_files[-1]]
+robot_by_id = index_by_frame_id(robot_files)
+tissue_by_id = index_by_frame_id(tissue_files)
+common_ids = sorted(set(robot_by_id) & set(tissue_by_id)) if tissue_by_id else sorted(robot_by_id)
+if not common_ids:
+    raise SystemExit("[ERROR] No robot/tissue frame pairs with matching frame IDs.")
 
-selected_tissue_files = tissue_files[::frame_stride] if tissue_files else []
-if len(selected_tissue_files) < 2 and len(tissue_files) > 1:
-    selected_tissue_files = [tissue_files[0], tissue_files[-1]]
+selected_ids = common_ids[::frame_stride]
+if len(selected_ids) < 2 and len(common_ids) > 1:
+    selected_ids = [common_ids[0], common_ids[-1]]
 
 robot_point_clouds = []
 tissue_point_clouds = []
 mins = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
 maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
-for path in selected_robot_files:
-    mesh = meshio.read(path)
-    points = np.asarray(mesh.points, dtype=np.float64)
-    if points.size == 0:
-        continue
-    robot_point_clouds.append((path, points))
-    mins = np.minimum(mins, points.min(axis=0))
-    maxs = np.maximum(maxs, points.max(axis=0))
 
-for path in selected_tissue_files:
-    mesh = meshio.read(path)
-    points = np.asarray(mesh.points, dtype=np.float64)
-    if points.size == 0:
+for step in selected_ids:
+    robot_path = robot_by_id[step]
+    robot_points = load_points(robot_path)
+    if robot_points.size == 0:
         continue
-    tissue_point_clouds.append((path, points))
-    mins = np.minimum(mins, points.min(axis=0))
-    maxs = np.maximum(maxs, points.max(axis=0))
+    robot_point_clouds.append((robot_path, robot_points))
+    mins = np.minimum(mins, robot_points.min(axis=0))
+    maxs = np.maximum(maxs, robot_points.max(axis=0))
+
+    if tissue_by_id:
+        tissue_path = tissue_by_id[step]
+        tissue_points = load_points(tissue_path)
+        if tissue_points.size == 0:
+            tissue_point_clouds.append((tissue_path, None))
+        else:
+            tissue_point_clouds.append((tissue_path, tissue_points))
+            mins = np.minimum(mins, tissue_points.min(axis=0))
+            maxs = np.maximum(maxs, tissue_points.max(axis=0))
 
 if len(robot_point_clouds) < 2:
     raise SystemExit("[ERROR] Need at least 2 non-empty VTK frames to render GIF.")
+
+dominant_robot_count = dominant_point_count(robot_point_clouds)
+dominant_tissue_count = dominant_point_count(
+    [(path, pts) for path, pts in tissue_point_clouds if pts is not None]
+)
+filtered_robot = []
+filtered_tissue = []
+skipped_topology = 0
+for (robot_path, robot_points), tissue_item in zip(robot_point_clouds, tissue_point_clouds or [None] * len(robot_point_clouds)):
+    if dominant_robot_count is not None and robot_points.shape[0] != dominant_robot_count:
+        skipped_topology += 1
+        continue
+    tissue_path, tissue_points = tissue_item if tissue_item is not None else (None, None)
+    if tissue_points is not None and dominant_tissue_count is not None and tissue_points.shape[0] != dominant_tissue_count:
+        skipped_topology += 1
+        continue
+    filtered_robot.append((robot_path, robot_points))
+    filtered_tissue.append((tissue_path, tissue_points))
+
+if skipped_topology:
+    print(
+        f"[WARN] Skipped {skipped_topology} frame(s) with mixed VTK topology. "
+        f"Keep robot={dominant_robot_count} tissue={dominant_tissue_count} points per frame."
+    )
+robot_point_clouds = filtered_robot
+tissue_point_clouds = filtered_tissue
+if len(robot_point_clouds) < 2:
+    raise SystemExit(
+        "[ERROR] After topology filtering, fewer than 2 frames remain. "
+        "Clear old sofa/vtk_output and rerun simulation."
+    )
 
 margin = 0.05 * np.maximum(maxs - mins, 1e-6)
 mins -= margin
@@ -194,20 +260,24 @@ ax.view_init(elev=elevation, azim=azimuth)
 if motion_scale <= 0:
     raise SystemExit("[ERROR] MOTION_SCALE must be > 0")
 
-def scaled_points(points):
+robot_rest_by_count = {first_robot_points.shape[0]: first_robot_points.copy()}
+tissue_rest_by_count = {}
+if first_tissue_points is not None:
+    tissue_rest_by_count[first_tissue_points.shape[0]] = first_tissue_points.copy()
+
+
+def scaled_points(points, rest_by_count):
     if motion_scale == 1.0:
         return points
-    return first_robot_points + motion_scale * (points - first_robot_points)
-
-
-def scaled_tissue_points(points):
-    if motion_scale == 1.0 or first_tissue_points is None:
+    rest = rest_by_count.get(points.shape[0])
+    if rest is None or rest.shape != points.shape:
         return points
-    return first_tissue_points + motion_scale * (points - first_tissue_points)
+    return rest + motion_scale * (points - rest)
+
 
 def update(frame_idx):
     _path, robot_points = robot_point_clouds[frame_idx]
-    render_robot_points = scaled_points(robot_points)
+    render_robot_points = scaled_points(robot_points, robot_rest_by_count)
     robot_scatter._offsets3d = (
         render_robot_points[:, 0],
         render_robot_points[:, 1],
@@ -217,13 +287,14 @@ def update(frame_idx):
 
     if tissue_scatter is not None and frame_idx < len(tissue_point_clouds):
         _, tissue_points = tissue_point_clouds[frame_idx]
-        render_tissue_points = scaled_tissue_points(tissue_points)
-        tissue_scatter._offsets3d = (
-            render_tissue_points[:, 0],
-            render_tissue_points[:, 1],
-            render_tissue_points[:, 2],
-        )
-        artists.append(tissue_scatter)
+        if tissue_points is not None:
+            render_tissue_points = scaled_points(tissue_points, tissue_rest_by_count)
+            tissue_scatter._offsets3d = (
+                render_tissue_points[:, 0],
+                render_tissue_points[:, 1],
+                render_tissue_points[:, 2],
+            )
+            artists.append(tissue_scatter)
     ax.set_title(
         f"SOFA deformation demo ({frame_idx + 1}/{len(robot_point_clouds)}) | motion_scale={motion_scale:.2f}"
     )
@@ -246,8 +317,8 @@ tip_displacements = [
 ]
 print(f"[OK] Saved GIF: {output_gif}")
 print(
-    f"[INFO] Robot frames: {len(robot_files)} -> rendered {len(robot_point_clouds)}; "
-    f"Tissue frames: {len(tissue_files)} -> rendered {len(tissue_point_clouds)}; stride={frame_stride}"
+    f"[INFO] Robot frames: {len(robot_files)}; Tissue frames: {len(tissue_files)}; "
+    f"paired IDs: {len(common_ids)} -> rendered {len(robot_point_clouds)}; stride={frame_stride}"
 )
 print(
     "[INFO] Tip displacement stats (raw meters): "
