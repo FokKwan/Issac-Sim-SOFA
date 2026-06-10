@@ -20,14 +20,14 @@ class SoftSofaEnv(gym.Env):
         super().__init__()
         self.sofa = SofaCableClient()
         self.max_episode_steps = int(max_episode_steps)
-        # 归一化动作到物理控制量的缩放系数：
-        # SOFA 实际控制量 cable_disp = action * action_scale
-        self.action_scale = 1.2
-        # 安全阈值参数（用于 done 判定）
-        self.max_von_mises = 2500.0
-        self.max_avg_strain = 0.45
-        self.max_tissue_strain = 0.35
-        self.max_lesion_strain = 0.30
+        # 归一化动作到曲率增量的缩放系数：
+        # SOFA 每步累积 cable_disp = action * action_scale（增量控制）
+        self.action_scale = 1.0
+        # 安全阈值参数（用于 done 判定，略放宽以允许更大动作）
+        self.max_von_mises = 3200.0
+        self.max_avg_strain = 0.55
+        self.max_tissue_strain = 0.50
+        self.max_lesion_strain = 0.42
         # 接触力阈值参数：
         # - min_contact_force: 成功接触的下限（避免“无接触假成功”）
         # - max_contact_force: 成功接触的上限（避免过压）
@@ -100,7 +100,7 @@ class SoftSofaEnv(gym.Env):
         # SB3 输出一般是 ndarray，这里统一为标量并裁剪到 [-1, 1]
         normalized_action = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
         normalized_action = float(np.clip(normalized_action, -1.0, 1.0))
-        # 动作映射到 SOFA 缆绳位移
+        # 动作映射到 SOFA 曲率增量（累积弯曲）
         cable_disp = normalized_action * self.action_scale
         sofa_obs = self.sofa.step(cable_disp=cable_disp)
         if not self._is_valid_sofa_obs(sofa_obs):
@@ -181,7 +181,7 @@ class SoftSofaEnv(gym.Env):
         # 2) progress_term: 奖励相对上一步的距离改善，降低“原地抖动”
         progress = self._prev_lesion_distance - lesion_distance
         self._last_progress = float(progress)
-        progress_term = self.progress_gain * float(np.clip(progress, -0.05, 0.05))
+        progress_term = self.progress_gain * float(np.clip(progress, -0.12, 0.12))
         contact_force_peak = float(obs["contact_force_peak"][0])
         # 3) contact_term: 鼓励接触力接近期望区间，且距离病灶越近权重越高
         contact_alignment = np.exp(

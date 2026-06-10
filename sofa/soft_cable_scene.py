@@ -22,19 +22,21 @@ SofaRuntime.importPlugin("SoftRobots")
 # 机器人材料参数（线弹性近似）
 ROBOT_YOUNG_MODULUS = 3000.0
 ROBOT_POISSON_RATIO = 0.45
-# 组织材料参数（更软）
-TISSUE_YOUNG_MODULUS = 1200.0
+# 组织材料参数（更软，便于产生可见形变）
+TISSUE_YOUNG_MODULUS = 800.0
 TISSUE_POISSON_RATIO = 0.46
 # 分段常曲率（PCC）机器人参数
-PCC_SEGMENT_LENGTHS = [0.25, 0.25, 0.25, 0.25]
-PCC_SEGMENT_WEIGHTS = [1.00, 0.85, 0.70, 0.55]
+PCC_SEGMENT_LENGTHS = [0.30, 0.30, 0.30, 0.30]
+PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
-PCC_MAX_CURVATURE = 4.0  # 1/m
+PCC_MAX_CURVATURE = 6.0  # 1/m，允许更大幅度弯曲
 # 机器人基座初始偏移（右侧固定，主轴沿 x 方向）
 PCC_BASE_OFFSET = np.array([0.45, 0.03, 0.0], dtype=np.float64)
-# 缆绳控制参数：限制绝对位移，避免数值发散
-CABLE_DISP_LIMIT = 1.5
-CABLE_DISP_SCALE = 1.0
+# 缆绳控制参数：每步曲率增量（累积控制，更接近真实缆绳拉动）
+CURVATURE_DELTA_SCALE = 0.55
+CURVATURE_DELTA_LIMIT = 0.65
+# 每个 RL step 执行的物理子步数，提升组织响应幅度
+PHYSICS_SUBSTEPS = 5
 # VTK 导出默认间隔（每 N 个仿真 step 导出一次）
 DEFAULT_EXPORT_INTERVAL = 10
 # 力统计距离门限：距离大于该值时视作“非接触”
@@ -101,12 +103,12 @@ def createScene(root):
     root.addObject("CollisionPipeline")
     root.addObject("BruteForceBroadPhase")
     root.addObject("BVHNarrowPhase")
-    root.addObject("LocalMinDistance", alarmDistance=0.006, contactDistance=0.002, angleCone=0.0)
+    root.addObject("LocalMinDistance", alarmDistance=0.005, contactDistance=0.0015, angleCone=0.0)
     root.addObject(
         "CollisionResponse",
         name="contact_response",
         response="FrictionContactConstraint",
-        responseParams="mu=0.2",
+        responseParams="mu=0.45",
     )
 
     # 1) 连续体机器人节点（分段常曲率 PCC 模型）
@@ -418,16 +420,28 @@ def main():
                 else:
                     baseline_force_level = (0.0, 0.0, 0.0)
             else:
-                # 执行一步控制
+                # 执行一步控制：cable_disp 为曲率增量，累积后限幅
                 raw_cable_disp = float(cmd.get("cable_disp", 0.0))
-                # 动作缩放+限幅，防止超大控制导致数值问题
+                curvature_delta = float(
+                    np.clip(
+                        raw_cable_disp * CURVATURE_DELTA_SCALE,
+                        -CURVATURE_DELTA_LIMIT,
+                        CURVATURE_DELTA_LIMIT,
+                    )
+                )
                 current_curvature_cmd = float(
-                    np.clip(raw_cable_disp * CABLE_DISP_SCALE, -CABLE_DISP_LIMIT, CABLE_DISP_LIMIT)
+                    np.clip(
+                        current_curvature_cmd + curvature_delta,
+                        -PCC_MAX_CURVATURE,
+                        PCC_MAX_CURVATURE,
+                    )
                 )
                 apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
-                
-                # 物理步进
-                Sofa.Simulation.animate(root, float(root.dt.value))
+
+                # 多子步物理积分，使组织形变更充分
+                dt = float(root.dt.value)
+                for _ in range(PHYSICS_SUBSTEPS):
+                    Sofa.Simulation.animate(root, dt)
                 step_count += 1
 
             # 周期导出 VTK 供 ParaView / GIF 可视化

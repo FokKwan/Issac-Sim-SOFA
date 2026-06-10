@@ -48,15 +48,13 @@
   - `FreeMotionAnimationLoop`
   - `GenericConstraintSolver(computeConstraintForces=True)`
   - 接触流水线：`CollisionPipeline` / `BruteForceBroadPhase` / `BVHNarrowPhase`
-  - 接触判定：`LocalMinDistance(alarmDistance=0.006, contactDistance=0.002)`
-  - 响应：`CollisionResponse(FrictionContactConstraint, mu=0.2)`
+  - 接触判定：`LocalMinDistance(alarmDistance=0.005, contactDistance=0.0015)`
+  - 响应：`CollisionResponse(FrictionContactConstraint, mu=0.45)`
 
 - Robot (`SoftBody`):
-  - `RegularGridTopology` (3x3x10)
-  - `MechanicalObject(Vec3d)`
-  - `HexahedronFEMForceField(method="large")`
-  - `CableConstraint`（动作控制入口）
-  - `BoxROI + FixedConstraint`（基座固定）
+  - 分段常曲率（PCC）中心线 + `MechanicalObject(Vec3d)`
+  - 每步按累积曲率增量更新形状（固定基端）
+  - `PointCollisionModel` + `LineCollisionModel`
 
 - Tissue (`TargetTissue`):
   - `RegularGridTopology` (8x5x6)
@@ -97,7 +95,7 @@ SOFA_EXPORT_INTERVAL=5  # 每 5 步导出一次
 ### 4.1 Action Space
 
 - `Box(low=-1, high=1, shape=(1,))`
-- 实际控制量：`cable_disp = action * action_scale`
+- 实际控制量：`cable_disp = action * action_scale`（**曲率增量**，SOFA 侧逐步累积）
 
 ### 4.2 Observation Space
 
@@ -175,7 +173,7 @@ MOTION_SCALE=3 FRAME_STRIDE=5 scripts/make_demo_gif.sh logs/sofa_robot_tissue.gi
 
 1. `von_mises` 仍为位移驱动的代理指标，不是完整本构后处理真值。
 2. 接触力统计是求解器约束层面的全局统计，后续可细化为“病灶邻域接触力”。
-3. 目前单 action 对应单物理步，后续可增加 action repeat/substeps 提升稳定性。
+3. 每个 RL action 已在 SOFA 侧执行 `PHYSICS_SUBSTEPS=5` 次物理积分，提升组织响应幅度。
 
 ---
 
