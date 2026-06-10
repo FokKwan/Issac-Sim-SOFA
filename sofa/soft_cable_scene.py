@@ -31,8 +31,14 @@ PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 6.0  # 1/m，允许更大幅度弯曲
 # 机器人基座初始偏移（右侧固定，主轴沿 x 方向）
-# 经 PCC 工作空间校核：该基座使 κ≈-5.7 时末端可达病灶 (0.08, -0.12)
+# 经 PCC 工作空间校核：该基座使 κ≈-5.7 时末端可接近病灶 (0.08, -0.14)
 PCC_BASE_OFFSET = np.array([0.10, -0.08, 0.0], dtype=np.float64)
+# 组织初始位置：整体放在机器人初始直线下方，避免 reset 首帧穿模。
+# 初始机器人中心线为 y=-0.08，组织上表面 y=-0.10，保留 2 cm 间隙。
+TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
+TISSUE_GRID_MAX = np.array([0.25, -0.10, 0.06], dtype=np.float64)
+LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
+LESION_RADIUS = 0.025
 # 缆绳控制参数：每步曲率增量（累积控制，更接近真实缆绳拉动）
 CURVATURE_DELTA_SCALE = 0.55
 CURVATURE_DELTA_LIMIT = 0.65
@@ -77,6 +83,18 @@ def generate_segmented_constant_curvature_points(curvature_command):
             current[1] -= np.sin(theta) * ds
             points.append(current.copy())
     return np.asarray(points, dtype=np.float64)
+
+
+def compute_point_cloud_aabb_clearance(points, bbox_min, bbox_max):
+    """
+    计算点云到轴对齐包围盒的最小外部距离；若点在盒内则距离为 0。
+    """
+    if points.size == 0:
+        return float("inf")
+    lower_gap = np.maximum(bbox_min - points, 0.0)
+    upper_gap = np.maximum(points - bbox_max, 0.0)
+    outside_delta = lower_gap + upper_gap
+    return float(np.min(np.linalg.norm(outside_delta, axis=1)))
 
 def createScene(root):
     """
@@ -131,8 +149,8 @@ def createScene(root):
     tissue.addObject(
         "RegularGridTopology",
         name="grid",
-        min=[-0.18, -0.18, -0.06],
-        max=[0.25, -0.06, 0.06],
+        min=TISSUE_GRID_MIN.tolist(),
+        max=TISSUE_GRID_MAX.tolist(),
         nx=10,
         ny=6,
         nz=5,
@@ -152,7 +170,14 @@ def createScene(root):
     tissue.addObject(
         "BoxROI",
         name="fixed_roi",
-        box=[-0.19, -0.181, -0.07, 0.26, -0.171, 0.07],
+        box=[
+            TISSUE_GRID_MIN[0] - 0.01,
+            TISSUE_GRID_MIN[1] - 0.001,
+            TISSUE_GRID_MIN[2] - 0.01,
+            TISSUE_GRID_MAX[0] + 0.01,
+            TISSUE_GRID_MIN[1] + 0.009,
+            TISSUE_GRID_MAX[2] + 0.01,
+        ],
         drawBoxes=False,
     )
     tissue.addObject("FixedConstraint", indices="@fixed_roi.indices")
@@ -367,12 +392,24 @@ def main():
     robot_rest_positions = apply_robot_pcc_shape(robot_dofs, curvature_command=0.0)
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
     rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
+    initial_clearance = compute_point_cloud_aabb_clearance(
+        robot_rest_positions,
+        TISSUE_GRID_MIN,
+        TISSUE_GRID_MAX,
+    )
+    print(
+        "[SOFA] Initial robot-tissue AABB clearance: "
+        f"{initial_clearance:.4f} m"
+    )
+    if initial_clearance <= 0.0:
+        print("[WARN] Initial robot centerline overlaps the tissue AABB.")
+
     # 病灶初始中心（可作为任务配置参数暴露给上层）
-    lesion_center_ref = np.array([0.08, -0.12, 0.0])
+    lesion_center_ref = LESION_CENTER_REF.copy()
     lesion_indices = compute_lesion_mask(
         tissue_rest_positions,
         lesion_center=lesion_center_ref,
-        lesion_radius=0.025,
+        lesion_radius=LESION_RADIUS,
     )
     print(f"Lesion region nodes: {len(lesion_indices)}")
     baseline_force_level = (0.0, 0.0, 0.0)
