@@ -30,9 +30,9 @@ PCC_SEGMENT_LENGTHS = [0.30, 0.30, 0.30, 0.30]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 6.0  # 1/m，允许更大幅度弯曲
-# 机器人基座初始偏移（右侧固定，主轴沿 x 方向）
-# 经 PCC 工作空间校核：该基座使 κ≈-5.7 时末端可接近病灶 (0.08, -0.14)
-PCC_BASE_OFFSET = np.array([0.10, -0.08, 0.0], dtype=np.float64)
+# 机器人基座初始偏移（左侧固定，主轴沿 +x 方向）
+# 初始 tip 在原基座附近 (0.10, -0.08)，负曲率时末端向组织/病灶方向弯曲。
+PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
 # 组织初始位置：整体放在机器人初始直线下方，避免 reset 首帧穿模。
 # 初始机器人中心线为 y=-0.08，组织上表面 y=-0.10，保留 2 cm 间隙。
 TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
@@ -78,9 +78,9 @@ def generate_segmented_constant_curvature_points(curvature_command):
         ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
         for _ in range(PCC_POINTS_PER_SEGMENT):
             theta += seg_kappa * ds
-            # 平面常曲率：主轴沿 X，弯曲发生在 X-Y 平面（向下接触组织）
-            current[0] -= np.cos(theta) * ds
-            current[1] -= np.sin(theta) * ds
+            # 平面常曲率：主轴沿 +X，弯曲发生在 X-Y 平面（负曲率向下接触组织）
+            current[0] += np.cos(theta) * ds
+            current[1] += np.sin(theta) * ds
             points.append(current.copy())
     return np.asarray(points, dtype=np.float64)
 

@@ -55,7 +55,7 @@
   - 分段常曲率（PCC）中心线 + `MechanicalObject(Vec3d)`
   - 每步按累积曲率增量更新形状（固定基端）
   - `PointCollisionModel` + `LineCollisionModel`
-  - 基座 `PCC_BASE_OFFSET = (0.10, -0.08, 0)`，初始中心线位于组织上方约 `0.02 m`
+  - 基座 `PCC_BASE_OFFSET = (-1.10, -0.08, 0)`，初始 tip 位于 `(0.10, -0.08, 0)`，中心线位于组织上方约 `0.02 m`
 
 - Tissue (`TargetTissue`):
   - `RegularGridTopology` (10x6x5)，范围 `min=(-0.18, -0.22, -0.06)` 到 `max=(0.25, -0.10, 0.06)`
