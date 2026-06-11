@@ -20,8 +20,9 @@ class SoftSofaEnv(gym.Env):
         super().__init__()
         self.sofa = SofaCableClient()
         self.max_episode_steps = int(max_episode_steps)
-        # 归一化动作到曲率增量的缩放系数：
-        # SOFA 每步累积 cable_disp = action * action_scale（增量控制）
+        self.t = 0
+        # 归一化动作到二维曲率增量的缩放系数：
+        # SOFA 每步累积 cable_disp = [ky_delta, kz_delta] * action_scale。
         self.action_scale = 1.0
         # 安全阈值参数（用于 done 判定，略放宽以允许更大动作）
         self.max_von_mises = 3200.0
@@ -33,17 +34,19 @@ class SoftSofaEnv(gym.Env):
         # - max_contact_force: 成功接触的上限（避免过压）
         self.max_contact_force = 1.4
         self.min_contact_force = 0.02
-        # 成功距离阈值（tip 到病灶中心）
-        self.success_distance = 0.035
+        # 绕病灶画圆任务参数：圆在 Y-Z 平面内，圆心为病灶中心。
+        self.circle_radius = 0.06
+        self.circle_period_steps = 240
+        self.circle_target_tolerance = 0.025
         # 奖励整形参数
-        self.desired_contact_force = 0.40
-        self.contact_force_sigma = 0.20
-        self.progress_gain = 6.0
+        self.tracking_gain = 8.0
+        self.radial_gain = 2.0
+        self.progress_gain = 3.0
         self.time_penalty = 0.002
 
         # 1. 定义动作空间 (Action Space)
-        # 标准化动作空间，发送前再做尺度映射
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        # 标准化二维动作：[ky_delta, kz_delta]，发送前再做尺度映射
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
         # 2. 定义观测空间 (Observation Space)
         # 每个键都需与 _build_obs 完全对应。
@@ -55,6 +58,9 @@ class SoftSofaEnv(gym.Env):
         # - contact_distance: 末端到组织最近距离
         # - contact_force_mean/peak/total: 约束求解器接触力统计
         # - lesion_center: 病灶中心位置
+        # - circle_target: 当前相位下末端应追踪的圆周目标点
+        # - circle_phase: 当前圆周相位 [0, 2pi]
+        # - circle_error: 末端到 circle_target 的距离
         self.observation_space = spaces.Dict({
             "tip_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             "von_mises": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
@@ -67,10 +73,13 @@ class SoftSofaEnv(gym.Env):
             "contact_force_peak": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "contact_force_total": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "lesion_center": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            "circle_target": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            "circle_phase": spaces.Box(low=0.0, high=2.0 * np.pi, shape=(1,), dtype=np.float32),
+            "circle_error": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
         })
         # 通信异常兜底：保留上一帧有效观测，避免训练循环崩溃
         self._last_obs = self._build_obs(self._default_sofa_obs())
-        self._prev_lesion_distance = float(self._last_obs["lesion_distance"][0])
+        self._prev_circle_error = float(self._last_obs["circle_error"][0])
         self._last_progress = 0.0
 
     def reset(self, seed=None, options=None):
@@ -88,7 +97,7 @@ class SoftSofaEnv(gym.Env):
 
         obs = self._build_obs(sofa_obs)
         self._last_obs = obs
-        self._prev_lesion_distance = float(obs["lesion_distance"][0])
+        self._prev_circle_error = float(obs["circle_error"][0])
         self._last_progress = 0.0
 
         # 必须要返回 obs 和 info 两个变量
@@ -97,10 +106,12 @@ class SoftSofaEnv(gym.Env):
     def step(self, action):
         self.t += 1
 
-        # SB3 输出一般是 ndarray，这里统一为标量并裁剪到 [-1, 1]
-        normalized_action = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
-        normalized_action = float(np.clip(normalized_action, -1.0, 1.0))
-        # 动作映射到 SOFA 曲率增量（累积弯曲）
+        # SB3 输出一般是 ndarray，这里统一为二维向量并裁剪到 [-1, 1]
+        normalized_action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if normalized_action.size < 2:
+            normalized_action = np.pad(normalized_action, (0, 2 - normalized_action.size))
+        normalized_action = np.clip(normalized_action[:2], -1.0, 1.0)
+        # 动作映射到 SOFA 二维曲率增量（累积弯曲）
         cable_disp = normalized_action * self.action_scale
         sofa_obs = self.sofa.step(cable_disp=cable_disp)
         if not self._is_valid_sofa_obs(sofa_obs):
@@ -112,6 +123,7 @@ class SoftSofaEnv(gym.Env):
                 "lesion_strain": float(self._last_obs["lesion_strain"][0]),
                 "tissue_strain": float(self._last_obs["tissue_strain"][0]),
                 "lesion_distance": float(self._last_obs["lesion_distance"][0]),
+                "circle_error": float(self._last_obs["circle_error"][0]),
                 "contact_force_peak": float(self._last_obs["contact_force_peak"][0]),
                 "success": False,
             }
@@ -120,7 +132,7 @@ class SoftSofaEnv(gym.Env):
         obs = self._build_obs(sofa_obs)
         self._last_obs = obs
         reward = float(self._compute_reward(obs))
-        self._prev_lesion_distance = float(obs["lesion_distance"][0])
+        self._prev_circle_error = float(obs["circle_error"][0])
         
         # terminated: 安全超限或任务成功；truncated: 达到步数上限
         terminated = self._check_done(obs)
@@ -134,6 +146,9 @@ class SoftSofaEnv(gym.Env):
             "lesion_strain": float(obs["lesion_strain"][0]),
             "tissue_strain": float(obs["tissue_strain"][0]),
             "lesion_distance": float(obs["lesion_distance"][0]),
+            "circle_phase": float(obs["circle_phase"][0]),
+            "circle_error": float(obs["circle_error"][0]),
+            "circle_target": obs["circle_target"].tolist(),
             "contact_force_mean": float(obs["contact_force_mean"][0]),
             "contact_force_peak": float(obs["contact_force_peak"][0]),
             "contact_force_total": float(obs["contact_force_total"][0]),
@@ -159,6 +174,10 @@ class SoftSofaEnv(gym.Env):
         if lesion_center.shape[0] != 3:
             lesion_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
+        circle_phase = self._circle_phase()
+        circle_target = self._circle_target(lesion_center, circle_phase)
+        circle_error = float(np.linalg.norm(tip_pos - circle_target))
+
         return {
             "tip_pos": tip_pos,
             "von_mises": np.array([float(sofa_obs.get("von_mises", 0.0))], dtype=np.float32),
@@ -171,43 +190,40 @@ class SoftSofaEnv(gym.Env):
             "contact_force_peak": np.array([float(sofa_obs.get("contact_force_peak", 0.0))], dtype=np.float32),
             "contact_force_total": np.array([float(sofa_obs.get("contact_force_total", 0.0))], dtype=np.float32),
             "lesion_center": lesion_center,
+            "circle_target": circle_target.astype(np.float32),
+            "circle_phase": np.array([circle_phase], dtype=np.float32),
+            "circle_error": np.array([circle_error], dtype=np.float32),
         }
 
     def _compute_reward(self, obs):
-        # 奖励设计：
-        # 1) task_term: 鼓励靠近病灶（距离越小越高）
-        lesion_distance = float(obs["lesion_distance"][0])
-        task_term = -1.2 * lesion_distance
-        # 2) progress_term: 奖励相对上一步的距离改善，降低“原地抖动”
-        progress = self._prev_lesion_distance - lesion_distance
+        # 奖励设计：追踪病灶周围圆形目标点，同时惩罚偏离圆半径和危险形变。
+        circle_error = float(obs["circle_error"][0])
+        task_term = -self.tracking_gain * circle_error
+        progress = self._prev_circle_error - circle_error
         self._last_progress = float(progress)
-        progress_term = self.progress_gain * float(np.clip(progress, -0.12, 0.12))
+        progress_term = self.progress_gain * float(np.clip(progress, -0.08, 0.08))
+        lesion_center = obs["lesion_center"]
+        tip_pos = obs["tip_pos"]
+        radial_distance = float(np.linalg.norm(tip_pos[1:3] - lesion_center[1:3]))
+        radial_error = abs(radial_distance - self.circle_radius)
+        radial_penalty = self.radial_gain * radial_error
         contact_force_peak = float(obs["contact_force_peak"][0])
-        # 3) contact_term: 鼓励接触力接近期望区间，且距离病灶越近权重越高
-        contact_alignment = np.exp(
-            -((contact_force_peak - self.desired_contact_force) ** 2)
-            / (2.0 * self.contact_force_sigma ** 2)
-        )
-        contact_term = 0.8 * contact_alignment * np.exp(-2.0 * lesion_distance)
-        # 4) safety_penalty: 惩罚机器人/组织/病灶应变
         safety_penalty = (
             0.03 * float(obs["von_mises"][0])
             + 0.05 * float(obs["avg_strain"][0])
             + 0.10 * float(obs["tissue_strain"][0])
             + 0.14 * float(obs["lesion_strain"][0])
         )
-        # 5) excessive_contact_penalty: 对过大接触力进行二次惩罚
         excessive_contact_penalty = 0.5 * max(contact_force_peak - self.max_contact_force, 0.0) ** 2
-        # 6) success_bonus: 达成任务时给一次额外奖励
-        success_bonus = 8.0 if self._is_success(obs) else 0.0
+        lap_bonus = 8.0 if self._is_success(obs) else 0.0
         return (
             task_term
             + progress_term
-            + contact_term
+            - radial_penalty
             - safety_penalty
             - excessive_contact_penalty
             - self.time_penalty
-            + success_bonus
+            + lap_bonus
         )
 
     def _check_done(self, obs):
@@ -221,11 +237,22 @@ class SoftSofaEnv(gym.Env):
         )
 
     def _is_success(self, obs):
-        # 成功定义：到达病灶附近 + 接触力处于可接受区间
+        # 成功定义：完成一圈后仍贴近当前圆周目标点。
         return bool(
-            obs["lesion_distance"][0] < self.success_distance
-            and self.min_contact_force < obs["contact_force_peak"][0] < self.max_contact_force
+            self.t >= self.circle_period_steps
+            and obs["circle_error"][0] < self.circle_target_tolerance
         )
+
+    def _circle_phase(self):
+        progress = min(max(self.t, 0), self.circle_period_steps) / float(self.circle_period_steps)
+        return float(2.0 * np.pi * progress)
+
+    def _circle_target(self, lesion_center, phase):
+        target = np.array(lesion_center, dtype=np.float32)
+        target[0] = lesion_center[0]
+        target[1] = lesion_center[1] + self.circle_radius * np.cos(phase)
+        target[2] = lesion_center[2] + self.circle_radius * np.sin(phase)
+        return target
 
     def _default_sofa_obs(self):
         # 通信失败或初始化阶段的兜底观测（键与 shape 必须完整）
@@ -240,7 +267,7 @@ class SoftSofaEnv(gym.Env):
             "contact_force_mean": 0.0,
             "contact_force_peak": 0.0,
             "contact_force_total": 0.0,
-            "lesion_center": [0.0, 0.0, 0.0],
+            "lesion_center": [0.08, -0.14, 0.0],
         }
 
     def _is_valid_sofa_obs(self, sofa_obs):

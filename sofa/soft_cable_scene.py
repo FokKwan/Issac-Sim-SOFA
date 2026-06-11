@@ -63,24 +63,34 @@ def generate_segmented_constant_curvature_points(curvature_command):
     生成固定基端的分段常曲率（PCC）中心线。
 
     Args:
-        curvature_command: 全局控制曲率（标量），每段按权重缩放后保持常数。
+        curvature_command: 全局控制曲率，可以是标量 ky 或二维向量 [ky, kz]。
 
     Returns:
         np.ndarray: (N, 3) 机器人中心线点集
     """
-    kappa = float(np.clip(curvature_command, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE))
+    curvature = np.asarray(curvature_command, dtype=np.float64).reshape(-1)
+    if curvature.size == 0:
+        curvature = np.zeros(2, dtype=np.float64)
+    elif curvature.size == 1:
+        curvature = np.array([curvature[0], 0.0], dtype=np.float64)
+    else:
+        curvature = curvature[:2]
+    curvature = np.clip(curvature, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE)
     points = [PCC_BASE_OFFSET.copy()]
-    theta = 0.0
+    theta_y = 0.0
+    theta_z = 0.0
     current = points[0].copy()
 
     for seg_len, seg_weight in zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS):
-        seg_kappa = kappa * seg_weight
+        seg_curvature = curvature * seg_weight
         ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
         for _ in range(PCC_POINTS_PER_SEGMENT):
-            theta += seg_kappa * ds
-            # 平面常曲率：主轴沿 +X，弯曲发生在 X-Y 平面（负曲率向下接触组织）
-            current[0] += np.cos(theta) * ds
-            current[1] += np.sin(theta) * ds
+            theta_y += seg_curvature[0] * ds
+            theta_z += seg_curvature[1] * ds
+            # 主轴沿 +X。ky 控制 X-Y 平面弯曲，kz 控制 X-Z 平面弯曲。
+            current[0] += np.cos(theta_y) * np.cos(theta_z) * ds
+            current[1] += np.sin(theta_y) * ds
+            current[2] += np.sin(theta_z) * ds
             points.append(current.copy())
     return np.asarray(points, dtype=np.float64)
 
@@ -387,7 +397,7 @@ def main():
 
     robot_dofs = root.SoftBody.dofs
     tissue_dofs = root.TargetTissue.dofs
-    current_curvature_cmd = 0.0
+    current_curvature_cmd = np.zeros(2, dtype=np.float64)
 
     robot_rest_positions = apply_robot_pcc_shape(robot_dofs, curvature_command=0.0)
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
@@ -440,7 +450,7 @@ def main():
                 # reset：重置场景、控制量与参考状态，用于 episode 开始
                 Sofa.Simulation.reset(root)
                 step_count = 0
-                current_curvature_cmd = 0.0
+                current_curvature_cmd = np.zeros(2, dtype=np.float64)
                 robot_rest_positions = apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
                 # reset 后推进一个小步以刷新位置缓存
                 Sofa.Simulation.animate(root, 0.0001)
@@ -459,22 +469,29 @@ def main():
                     baseline_force_level = (0.0, 0.0, 0.0)
             else:
                 # 执行一步控制：cable_disp 为曲率增量，累积后限幅
-                raw_cable_disp = float(cmd.get("cable_disp", 0.0))
-                curvature_delta = float(
-                    np.clip(
-                        raw_cable_disp * CURVATURE_DELTA_SCALE,
-                        -CURVATURE_DELTA_LIMIT,
-                        CURVATURE_DELTA_LIMIT,
-                    )
+                raw_cable_disp = np.asarray(cmd.get("cable_disp", [0.0, 0.0]), dtype=np.float64).reshape(-1)
+                if raw_cable_disp.size == 0:
+                    raw_cable_disp = np.zeros(2, dtype=np.float64)
+                elif raw_cable_disp.size == 1:
+                    raw_cable_disp = np.array([raw_cable_disp[0], 0.0], dtype=np.float64)
+                else:
+                    raw_cable_disp = raw_cable_disp[:2]
+                curvature_delta = np.clip(
+                    raw_cable_disp * CURVATURE_DELTA_SCALE,
+                    -CURVATURE_DELTA_LIMIT,
+                    CURVATURE_DELTA_LIMIT,
                 )
-                current_curvature_cmd = float(
-                    np.clip(
-                        current_curvature_cmd + curvature_delta,
-                        -PCC_MAX_CURVATURE,
-                        PCC_MAX_CURVATURE,
-                    )
+                current_curvature_cmd = np.clip(
+                    current_curvature_cmd + curvature_delta,
+                    -PCC_MAX_CURVATURE,
+                    PCC_MAX_CURVATURE,
                 )
+                current_curvature_cmd = np.asarray(current_curvature_cmd, dtype=np.float64)
                 apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
+                curvature_magnitude = float(np.linalg.norm(current_curvature_cmd))
+                if curvature_magnitude > PCC_MAX_CURVATURE:
+                    current_curvature_cmd *= PCC_MAX_CURVATURE / max(curvature_magnitude, 1e-8)
+                    apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
 
                 # 多子步物理积分，使组织形变更充分
                 dt = float(root.dt.value)

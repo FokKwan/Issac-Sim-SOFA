@@ -2,9 +2,14 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+import numpy as np
 import zmq
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_array_like(value):
+    return isinstance(value, (list, tuple, np.ndarray))
 
 class SofaCableClient:
     """
@@ -58,13 +63,15 @@ class SofaCableClient:
                 self._reconnect()
         return None
 
-    def step(self, cable_disp: float):
+    def step(self, cable_disp):
         """
         发送控制量到 SOFA，执行一步物理仿真
         """
         cmd = {
             "type": "step",
-            "cable_disp": float(cable_disp)
+            "cable_disp": np.asarray(cable_disp, dtype=float).reshape(-1).tolist()
+            if _is_array_like(cable_disp)
+            else float(cable_disp)
         }
         return self._send_and_recv(cmd)
 

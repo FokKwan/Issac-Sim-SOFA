@@ -29,8 +29,8 @@
 
 每个 RL step 的数据流如下：
 
-1. PPO 输出归一化动作 `action in [-1, 1]`
-2. `SoftSofaEnv.step()` 将动作映射为 `cable_disp`
+1. PPO 输出归一化动作 `action in [-1, 1]^2`
+2. `SoftSofaEnv.step()` 将动作映射为二维曲率增量 `cable_disp=[ky_delta,kz_delta]`
 3. `SofaCableClient` 通过 ZMQ 发送 `{"type":"step","cable_disp":...}`
 4. SOFA 执行物理步进并计算状态
 5. SOFA 返回观测字典（含接触力统计、组织应变等）
@@ -53,7 +53,8 @@
 
 - Robot (`SoftBody`):
   - 分段常曲率（PCC）中心线 + `MechanicalObject(Vec3d)`
-  - 每步按累积曲率增量更新形状（固定基端）
+  - 每步按二维累积曲率增量更新形状（固定基端）
+  - `ky` 控制 X-Y 平面弯曲，`kz` 控制 X-Z 平面弯曲，使末端可在病灶周围画圆
   - `PointCollisionModel` + `LineCollisionModel`
   - 基座 `PCC_BASE_OFFSET = (-1.10, -0.08, 0)`，初始 tip 位于 `(0.10, -0.08, 0)`，中心线位于组织上方约 `0.02 m`
 
@@ -96,8 +97,8 @@ SOFA_EXPORT_INTERVAL=5  # 每 5 步导出一次
 
 ### 4.1 Action Space
 
-- `Box(low=-1, high=1, shape=(1,))`
-- 实际控制量：`cable_disp = action * action_scale`（**曲率增量**，SOFA 侧逐步累积）
+- `Box(low=-1, high=1, shape=(2,))`
+- 实际控制量：`cable_disp = action * action_scale`（二维曲率增量 `[ky_delta,kz_delta]`，SOFA 侧逐步累积）
 
 ### 4.2 Observation Space
 
@@ -109,23 +110,33 @@ SOFA_EXPORT_INTERVAL=5  # 每 5 步导出一次
 - `contact_distance`
 - `contact_force_mean`, `contact_force_peak`, `contact_force_total`
 - `lesion_center`
+- `circle_target`：当前相位下病灶周围圆轨迹的目标点
+- `circle_phase`：当前圆周相位
+- `circle_error`：末端到 `circle_target` 的距离
 
 ### 4.3 Reward Design
 
-`reward = task + contact - safety - over_contact + success_bonus`
+任务目标：末端围绕病灶中心在 `Y-Z` 平面追踪一圈圆形轨迹。
 
-- task: 负的病灶距离（越近越好）
-- contact: 使用 `contact_force_peak` 的饱和激励（`tanh`）
+- 圆心：`lesion_center`
+- 半径：`circle_radius = 0.06 m`
+- 周期：`circle_period_steps = 240`
+
+`reward = tracking + progress - radial - safety - over_contact + lap_bonus`
+
+- tracking: 惩罚末端到当前圆周目标点的距离
+- progress: 奖励相对上一步减小 `circle_error`
+- radial: 惩罚末端偏离圆半径
 - safety: 机器人/组织/病灶应变惩罚
 - over_contact: 过大接触力惩罚
-- success_bonus: 达成接近+合理接触时额外奖励
+- lap_bonus: 完成一圈且仍贴近目标点时额外奖励
 
 ### 4.4 Termination
 
 - 安全超限（应变/应力/过大接触力）
 - 或达到成功条件：
-  - `lesion_distance < success_distance`
-  - `min_contact_force < contact_force_peak < max_contact_force`
+  - `t >= circle_period_steps`
+  - `circle_error < circle_target_tolerance`
 
 ---
 
