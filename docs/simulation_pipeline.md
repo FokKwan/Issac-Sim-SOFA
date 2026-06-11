@@ -55,6 +55,7 @@
   - 分段常曲率（PCC）中心线 + `MechanicalObject(Vec3d)`
   - 每步按二维累积曲率增量更新形状（固定基端）
   - `ky` 控制 X-Y 平面弯曲，`kz` 控制 X-Z 平面弯曲，使末端可在病灶周围画圆
+  - 曲率限制 `PCC_MAX_CURVATURE = 0.45`，每步曲率增量默认 `0.03`，避免末端甩出病灶工作区
   - `PointCollisionModel` + `LineCollisionModel`
   - 基座 `PCC_BASE_OFFSET = (-1.10, -0.08, 0)`，初始 tip 位于 `(0.10, -0.08, 0)`，中心线位于组织上方约 `0.02 m`
 
@@ -88,7 +89,7 @@ SOFA 每步回传：
 导出间隔通过环境变量控制：
 
 ```bash
-SOFA_EXPORT_INTERVAL=5  # 每 5 步导出一次
+SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 ```
 
 ---
@@ -121,6 +122,7 @@ SOFA_EXPORT_INTERVAL=5  # 每 5 步导出一次
 - 圆心：`lesion_center`
 - 半径：`circle_radius = 0.06 m`
 - 周期：`circle_period_steps = 240`
+- 工作空间检查：`python scripts/check_circle_workspace.py --radius 0.06`
 
 `reward = tracking + progress - radial - safety - over_contact + lap_bonus`
 
@@ -172,7 +174,7 @@ scripts/train_task.sh restart
 生成机器人+组织同屏 GIF：
 
 ```bash
-MOTION_SCALE=3 FRAME_STRIDE=5 scripts/make_demo_gif.sh logs/sofa_robot_tissue.gif
+MOTION_SCALE=3 FRAME_STRIDE=1 scripts/make_demo_gif.sh logs/sofa_robot_tissue.gif
 ```
 
 可选：

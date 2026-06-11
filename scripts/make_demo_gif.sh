@@ -8,7 +8,7 @@ cd "$REPO_ROOT"
 ROBOT_GLOB="${ROBOT_GLOB:-${INPUT_GLOB:-sofa/vtk_output/robot/frame_*.vtk}}"
 TISSUE_GLOB="${TISSUE_GLOB:-sofa/vtk_output/tissue/frame_*.vtk}"
 OUTPUT_GIF="${OUTPUT_GIF:-logs/sofa_demo.gif}"
-FRAME_STRIDE="${FRAME_STRIDE:-10}"
+FRAME_STRIDE="${FRAME_STRIDE:-1}"
 FPS="${FPS:-12}"
 POINT_SIZE="${POINT_SIZE:-12}"
 MOTION_SCALE="${MOTION_SCALE:-1.0}"
@@ -35,7 +35,7 @@ Environment overrides:
   TISSUE_GLOB  Default: sofa/vtk_output/tissue/frame_*.vtk
   INPUT_GLOB   Backward-compatible alias of ROBOT_GLOB
   OUTPUT_GIF   Default: logs/sofa_demo.gif
-  FRAME_STRIDE Default: 10
+  FRAME_STRIDE Default: 1
   FPS          Default: 12
   POINT_SIZE   Default: 12
   MOTION_SCALE Default: 1.0 (set >1.0 to amplify deformation visually)

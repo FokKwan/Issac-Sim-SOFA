@@ -29,7 +29,7 @@ TISSUE_POISSON_RATIO = 0.46
 PCC_SEGMENT_LENGTHS = [0.30, 0.30, 0.30, 0.30]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
-PCC_MAX_CURVATURE = 6.0  # 1/m，允许更大幅度弯曲
+PCC_MAX_CURVATURE = 0.45  # 1/m，聚焦在病灶周围画圆所需的小曲率工作空间
 # 机器人基座初始偏移（左侧固定，主轴沿 +x 方向）
 # 初始 tip 在原基座附近 (0.10, -0.08)，负曲率时末端向组织/病灶方向弯曲。
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
@@ -39,13 +39,15 @@ TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
 TISSUE_GRID_MAX = np.array([0.25, -0.10, 0.06], dtype=np.float64)
 LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
 LESION_RADIUS = 0.025
-# 缆绳控制参数：每步曲率增量（累积控制，更接近真实缆绳拉动）
-CURVATURE_DELTA_SCALE = 0.55
-CURVATURE_DELTA_LIMIT = 0.65
+# 缆绳控制参数：每步曲率增量（累积控制）。
+# 病灶圆轨迹所需曲率约在 +/-0.35 以内，较小增量可避免几步内甩出工作区。
+CURVATURE_DELTA_SCALE = 0.03
+CURVATURE_DELTA_LIMIT = 0.04
 # 每个 RL step 执行的物理子步数，提升组织响应幅度
 PHYSICS_SUBSTEPS = 5
-# VTK 导出默认间隔（每 N 个仿真 step 导出一次）
-DEFAULT_EXPORT_INTERVAL = 10
+# VTK 导出默认间隔（每 N 个仿真 step 导出一次）。
+# 默认更密集导出，避免生成的 GIF 帧数过少；长时间训练可用环境变量调大。
+DEFAULT_EXPORT_INTERVAL = 2
 # 力统计距离门限：距离大于该值时视作“非接触”
 CONTACT_FORCE_DISTANCE_GATE = 0.004
 
