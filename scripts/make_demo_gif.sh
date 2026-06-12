@@ -15,6 +15,8 @@ MOTION_SCALE="${MOTION_SCALE:-1.0}"
 METRICS_CSV="${METRICS_CSV:-sofa/vtk_output/frame_metrics.csv}"
 ELEVATION="${ELEVATION:-20}"
 AZIMUTH="${AZIMUTH:-40}"
+LESION_CENTER="${LESION_CENTER:-0.08,-0.14,0.0}"
+TARGET_RADIUS="${TARGET_RADIUS:-0.025}"
 VENV_PATH="${VENV_PATH:-.venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -43,6 +45,8 @@ Environment overrides:
   METRICS_CSV  Default: sofa/vtk_output/frame_metrics.csv
   ELEVATION    Default: 20
   AZIMUTH      Default: 40
+  LESION_CENTER Default: 0.08,-0.14,0.0
+  TARGET_RADIUS Default: 0.025
   VENV_PATH    Default: .venv
   PYTHON_BIN   Default: python3 (or .venv/bin/python when available)
 EOF
@@ -92,7 +96,7 @@ ensure_package meshio meshio
 ensure_package matplotlib matplotlib
 ensure_package PIL pillow
 
-export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE METRICS_CSV ELEVATION AZIMUTH
+export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE METRICS_CSV ELEVATION AZIMUTH LESION_CENTER TARGET_RADIUS
 
 "$PYTHON_BIN" - <<'PY'
 import glob
@@ -116,6 +120,20 @@ motion_scale = float(os.environ["MOTION_SCALE"])
 metrics_csv = os.environ["METRICS_CSV"]
 elevation = float(os.environ["ELEVATION"])
 azimuth = float(os.environ["AZIMUTH"])
+target_radius = float(os.environ["TARGET_RADIUS"])
+
+
+def parse_vec3(value, default):
+    try:
+        parts = [float(item.strip()) for item in value.split(",")]
+    except ValueError:
+        return np.asarray(default, dtype=np.float64)
+    if len(parts) != 3:
+        return np.asarray(default, dtype=np.float64)
+    return np.asarray(parts, dtype=np.float64)
+
+
+lesion_center = parse_vec3(os.environ["LESION_CENTER"], [0.08, -0.14, 0.0])
 
 
 def frame_id(path):
@@ -193,6 +211,16 @@ tissue_point_clouds = []
 frame_contact_values = []
 mins = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
 maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+circle_theta = np.linspace(0.0, 2.0 * np.pi, 160)
+target_circle_points = np.column_stack(
+    [
+        lesion_center[0] + target_radius * np.cos(circle_theta),
+        np.full_like(circle_theta, lesion_center[1]),
+        lesion_center[2] + target_radius * np.sin(circle_theta),
+    ]
+)
+mins = np.minimum(mins, target_circle_points.min(axis=0))
+maxs = np.maximum(maxs, target_circle_points.max(axis=0))
 
 for step in selected_ids:
     robot_path = robot_by_id[step]
@@ -311,6 +339,26 @@ if tissue_point_clouds:
         alpha=0.35,
         label="Target tissue",
     )
+target_circle_line, = ax.plot(
+    target_circle_points[:, 0],
+    target_circle_points[:, 1],
+    target_circle_points[:, 2],
+    color="#1f77b4",
+    linestyle="--",
+    linewidth=2.0,
+    alpha=0.95,
+    label="Target circle",
+)
+lesion_center_marker = ax.scatter(
+    [lesion_center[0]],
+    [lesion_center[1]],
+    [lesion_center[2]],
+    c="#1f77b4",
+    marker="x",
+    s=max(30.0, point_size * 3.0),
+    linewidths=1.5,
+    label="Lesion center",
+)
 ax.legend(loc="upper right")
 ax.view_init(elev=elevation, azim=azimuth)
 
@@ -344,7 +392,7 @@ def update(frame_idx):
         render_robot_points[:, 1],
         render_robot_points[:, 2],
     )
-    artists = [robot_scatter]
+    artists = [robot_scatter, target_circle_line, lesion_center_marker]
 
     if tissue_scatter is not None and frame_idx < len(tissue_point_clouds):
         _, tissue_points = tissue_point_clouds[frame_idx]
