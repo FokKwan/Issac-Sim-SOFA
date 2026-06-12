@@ -33,9 +33,9 @@ LESION_POISSON_RATIO = 0.47
 PCC_SEGMENT_LENGTHS = [0.30, 0.30, 0.30, 0.30]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
-PCC_MAX_CURVATURE = 0.45  # 1/m，聚焦在病灶周围画圆所需的小曲率工作空间
+PCC_MAX_CURVATURE = 1.20  # 1/m，固定基端后需要更大曲率进入组织内部画小圆
 PCC_CURVATURE_DOF = 4  # [ky_prox, ky_dist, kz_prox, kz_dist]，每个平面两段曲率可形成 S 型
-PCC_ACTION_DOF = PCC_CURVATURE_DOF + 1  # 再加一个沿 +X 插入/回撤自由度
+PCC_ACTION_DOF = PCC_CURVATURE_DOF + 1
 # 机器人基座初始偏移（左侧固定，主轴沿 +x 方向）
 # 初始 tip 在原基座附近 (0.10, -0.08)，负曲率时末端向组织/病灶方向弯曲。
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
@@ -115,16 +115,16 @@ def generate_segmented_constant_curvature_points(curvature_command, insertion_of
 
     Args:
         curvature_command: S 型曲率向量 [ky_prox, ky_dist, kz_prox, kz_dist]。
-        insertion_offset: 沿 +X 方向的插入/回撤位移。
+        insertion_offset: 固定基端下的有效伸出长度变化，正值让 tip 端伸出。
 
     Returns:
         np.ndarray: (N, 3) 机器人中心线点集
     """
     curvature = normalize_s_curve_curvature_command(curvature_command)
-    base_position = PCC_BASE_OFFSET + np.array(
-        [float(np.clip(insertion_offset, -INSERTION_LIMIT, INSERTION_LIMIT)), 0.0, 0.0],
-        dtype=np.float64,
-    )
+    insertion_offset = float(np.clip(insertion_offset, -INSERTION_LIMIT, INSERTION_LIMIT))
+    nominal_length = max(float(np.sum(PCC_SEGMENT_LENGTHS)), 1e-8)
+    length_scale = max(0.1, (nominal_length + insertion_offset) / nominal_length)
+    base_position = PCC_BASE_OFFSET.copy()
     points = [base_position.copy()]
     theta_y = 0.0
     theta_z = 0.0
@@ -133,7 +133,7 @@ def generate_segmented_constant_curvature_points(curvature_command, insertion_of
     segment_count = len(PCC_SEGMENT_LENGTHS)
     for seg_idx, (seg_len, seg_weight) in enumerate(zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS)):
         seg_curvature = segment_curvature_from_s_command(curvature, seg_idx, segment_count) * seg_weight
-        ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
+        ds = (seg_len * length_scale) / float(PCC_POINTS_PER_SEGMENT)
         for _ in range(PCC_POINTS_PER_SEGMENT):
             theta_y += seg_curvature[0] * ds
             theta_z += seg_curvature[1] * ds
@@ -565,7 +565,7 @@ def apply_robot_pcc_shape(robot_dofs, curvature_command, insertion_offset=0.0):
     Args:
         robot_dofs: SOFA MechanicalObject
         curvature_command: 目标曲率控制量
-        insertion_offset: 沿 +X 方向的插入/回撤位移
+        insertion_offset: 固定基端下的有效伸出长度变化
 
     Returns:
         np.ndarray: 更新后的中心线点集

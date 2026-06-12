@@ -276,7 +276,8 @@ ax.set_box_aspect((maxs - mins).tolist())
 
 first_robot_points = robot_point_clouds[0][1]
 contact_max = max(frame_contact_values) if frame_contact_values else 0.0
-use_contact_colors = bool(metrics_by_id) and contact_max > 0.0
+show_contact_values = bool(metrics_by_id)
+use_contact_colors = show_contact_values
 contact_norm = colors.Normalize(vmin=0.0, vmax=max(contact_max, 1e-8))
 robot_colors = (
     np.full(first_robot_points.shape[0], frame_contact_values[0])
@@ -356,7 +357,7 @@ def update(frame_idx):
             )
             artists.append(tissue_scatter)
     contact_text = ""
-    if use_contact_colors:
+    if show_contact_values:
         contact_text = f" | lesion_contact_peak={frame_contact_values[frame_idx]:.4f}"
     ax.set_title(
         f"SOFA deformation demo ({frame_idx + 1}/{len(robot_point_clouds)}) "
@@ -384,14 +385,12 @@ print(
     f"[INFO] Robot frames: {len(robot_files)}; Tissue frames: {len(tissue_files)}; "
     f"paired IDs: {len(common_ids)} -> rendered {len(robot_point_clouds)}; stride={frame_stride}"
 )
-if use_contact_colors:
+if show_contact_values:
     print(
         "[INFO] Lesion contact force peak stats: "
         f"min={min(frame_contact_values):.6f}, max={max(frame_contact_values):.6f}, "
         f"mean={float(np.mean(frame_contact_values)):.6f}"
     )
-elif metrics_by_id:
-    print("[INFO] Metrics CSV found, but all lesion_contact_force_peak values are zero.")
 print(
     "[INFO] Tip displacement stats (raw meters): "
     f"min={min(tip_displacements):.6f}, max={max(tip_displacements):.6f}, "

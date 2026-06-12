@@ -36,7 +36,8 @@ class SoftSofaEnv(gym.Env):
         self.max_contact_force = 1.4
         self.min_contact_force = 0.02
         # 绕病灶画圆任务参数：圆在 X-Z 平面内，圆心为病灶中心。
-        self.circle_radius = 0.06
+        # 半径等于病灶半径，小圆完整位于组织内部而不是贴边。
+        self.circle_radius = 0.025
         self.circle_period_steps = 240
         self.circle_target_tolerance = 0.025
         # 奖励整形参数
@@ -46,7 +47,7 @@ class SoftSofaEnv(gym.Env):
         self.time_penalty = 0.002
 
         # 1. 定义动作空间 (Action Space)
-        # 标准化五维动作：XY/XZ 平面各两个曲率段，可在每个平面形成 S 型弯曲。
+        # 标准化五维动作：XY/XZ 平面各两个曲率段，加 tip 端有效伸出长度。
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
 
         # 2. 定义观测空间 (Observation Space)

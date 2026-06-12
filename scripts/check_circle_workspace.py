@@ -10,10 +10,12 @@ import numpy as np
 PCC_SEGMENT_LENGTHS = [0.30, 0.30, 0.30, 0.30]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
-PCC_MAX_CURVATURE = 0.45
+PCC_MAX_CURVATURE = 1.20
 PCC_CURVATURE_DOF = 4
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
 LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
+TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
+TISSUE_GRID_MAX = np.array([0.25, -0.10, 0.06], dtype=np.float64)
 INSERTION_LIMIT = 0.08
 
 
@@ -47,18 +49,22 @@ def segment_curvature_from_s_command(curvature_command, segment_index, segment_c
 
 def generate_tip(curvature_command):
     command = np.asarray(curvature_command, dtype=np.float64).reshape(-1)
-    if command.size < PCC_CURVATURE_DOF + 1:
-        command = np.pad(command, (0, PCC_CURVATURE_DOF + 1 - command.size))
+    if command.size < PCC_CURVATURE_DOF:
+        command = np.pad(command, (0, PCC_CURVATURE_DOF - command.size))
     curvature = normalize_s_curve_curvature_command(command[:PCC_CURVATURE_DOF])
-    insertion_offset = float(np.clip(command[PCC_CURVATURE_DOF], -INSERTION_LIMIT, INSERTION_LIMIT))
+    insertion_offset = 0.0
+    if command.size > PCC_CURVATURE_DOF:
+        insertion_offset = float(np.clip(command[PCC_CURVATURE_DOF], -INSERTION_LIMIT, INSERTION_LIMIT))
+    nominal_length = max(float(np.sum(PCC_SEGMENT_LENGTHS)), 1e-8)
+    length_scale = max(0.1, (nominal_length + insertion_offset) / nominal_length)
     theta_y = 0.0
     theta_z = 0.0
-    current = PCC_BASE_OFFSET + np.array([insertion_offset, 0.0, 0.0], dtype=np.float64)
+    current = PCC_BASE_OFFSET.copy()
 
     segment_count = len(PCC_SEGMENT_LENGTHS)
     for seg_idx, (seg_len, seg_weight) in enumerate(zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS)):
         seg_curvature = segment_curvature_from_s_command(curvature, seg_idx, segment_count) * seg_weight
-        ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
+        ds = (seg_len * length_scale) / float(PCC_POINTS_PER_SEGMENT)
         for _ in range(PCC_POINTS_PER_SEGMENT):
             theta_y += seg_curvature[0] * ds
             theta_z += seg_curvature[1] * ds
@@ -75,12 +81,16 @@ def circle_target(radius, phase):
     )
 
 
+def point_inside_tissue(point):
+    return bool(np.all(point >= TISSUE_GRID_MIN) and np.all(point <= TISSUE_GRID_MAX))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--radius", type=float, default=0.06)
+    parser.add_argument("--radius", type=float, default=0.025)
     parser.add_argument("--samples", type=int, default=49)
-    parser.add_argument("--grid", type=int, default=91)
-    parser.add_argument("--insertion-grid", type=int, default=41)
+    parser.add_argument("--grid", type=int, default=25)
+    parser.add_argument("--insertion-grid", type=int, default=9)
     parser.add_argument("--tolerance", type=float, default=0.025)
     args = parser.parse_args()
 
@@ -88,19 +98,23 @@ def main():
     insertion_values = np.linspace(-INSERTION_LIMIT, INSERTION_LIMIT, args.insertion_grid)
     tips = []
     commands = []
-    for ky in curvature_values:
-        for kz in curvature_values:
-            for insertion_offset in insertion_values:
-                command = (ky, ky, kz, kz, insertion_offset)
-                commands.append(command)
-                tips.append(generate_tip(command))
+    for ky_prox in curvature_values:
+        for ky_dist in curvature_values:
+            for kz_prox in curvature_values:
+                for kz_dist in curvature_values:
+                    for insertion_offset in insertion_values:
+                        command = (ky_prox, ky_dist, kz_prox, kz_dist, insertion_offset)
+                        commands.append(command)
+                        tips.append(generate_tip(command))
     tips = np.asarray(tips)
     commands = np.asarray(commands)
 
     errors = []
     best_commands = []
+    tissue_flags = []
     for phase in np.linspace(0.0, 2.0 * math.pi, args.samples, endpoint=False):
         target = circle_target(args.radius, phase)
+        tissue_flags.append(point_inside_tissue(target))
         distances = np.linalg.norm(tips - target, axis=1)
         best_idx = int(np.argmin(distances))
         errors.append(float(distances[best_idx]))
@@ -111,11 +125,11 @@ def main():
     print(f"lesion_center={LESION_CENTER_REF.tolist()}")
     print(f"circle_radius={args.radius:.4f}")
     print(f"pcc_curvature_limit=+/-{PCC_MAX_CURVATURE:.4f}")
-    print(f"insertion_limit=+/-{INSERTION_LIMIT:.4f}")
     print(
         f"samples={args.samples} grid={args.grid} "
         f"insertion_grid={args.insertion_grid} tolerance={args.tolerance:.4f}"
     )
+    print(f"circle_inside_tissue={all(tissue_flags)}")
     print(f"max_error={errors.max():.6f}")
     print(f"mean_error={errors.mean():.6f}")
     print(f"min_error={errors.min():.6f}")
@@ -127,6 +141,8 @@ def main():
         f"kz_dist[{best_commands[:, 3].min():.4f},{best_commands[:, 3].max():.4f}] "
         f"insertion[{best_commands[:, 4].min():.4f},{best_commands[:, 4].max():.4f}]"
     )
+    if not all(tissue_flags):
+        raise SystemExit("FAIL: at least one circle target is outside the tissue volume.")
     if errors.max() <= args.tolerance:
         print("PASS: every sampled circle target is inside the reachable workspace tolerance.")
         return
