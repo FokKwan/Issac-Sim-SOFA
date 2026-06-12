@@ -121,9 +121,9 @@ SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 任务目标：末端围绕病灶中心在 `X-Z` 平面追踪一圈圆形轨迹。
 
 - 圆心：`lesion_center`
-- 半径：`circle_radius = 0.06 m`
+- 半径：`circle_radius = 0.05 m`
 - 周期：`circle_period_steps = 240`
-- 工作空间检查：`python scripts/check_circle_workspace.py --radius 0.06`
+- 工作空间检查：`python scripts/check_circle_workspace.py --radius 0.05`
 
 `reward = tracking + progress - radial - safety - over_contact + lap_bonus`
 

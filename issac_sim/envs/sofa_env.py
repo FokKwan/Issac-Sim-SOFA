@@ -36,8 +36,7 @@ class SoftSofaEnv(gym.Env):
         self.max_contact_force = 1.4
         self.min_contact_force = 0.02
         # 绕病灶画圆任务参数：圆在 X-Z 平面内，圆心为病灶中心。
-        # 半径等于病灶半径，小圆完整位于组织内部而不是贴边。
-        self.circle_radius = 0.025
+        self.circle_radius = 0.05
         self.circle_period_steps = 240
         self.circle_target_tolerance = 0.025
         # 奖励整形参数

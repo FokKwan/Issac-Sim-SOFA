@@ -87,7 +87,7 @@ def point_inside_tissue(point):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--radius", type=float, default=0.025)
+    parser.add_argument("--radius", type=float, default=0.05)
     parser.add_argument("--samples", type=int, default=49)
     parser.add_argument("--grid", type=int, default=25)
     parser.add_argument("--insertion-grid", type=int, default=9)

@@ -16,7 +16,7 @@ METRICS_CSV="${METRICS_CSV:-sofa/vtk_output/frame_metrics.csv}"
 ELEVATION="${ELEVATION:-20}"
 AZIMUTH="${AZIMUTH:-40}"
 LESION_CENTER="${LESION_CENTER:-0.08,-0.14,0.0}"
-TARGET_RADIUS="${TARGET_RADIUS:-0.025}"
+TARGET_RADIUS="${TARGET_RADIUS:-0.05}"
 VENV_PATH="${VENV_PATH:-.venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -46,7 +46,7 @@ Environment overrides:
   ELEVATION    Default: 20
   AZIMUTH      Default: 40
   LESION_CENTER Default: 0.08,-0.14,0.0
-  TARGET_RADIUS Default: 0.025
+  TARGET_RADIUS Default: 0.05
   VENV_PATH    Default: .venv
   PYTHON_BIN   Default: python3 (or .venv/bin/python when available)
 EOF
