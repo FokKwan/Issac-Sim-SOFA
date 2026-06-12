@@ -25,11 +25,17 @@ ROBOT_POISSON_RATIO = 0.45
 # 组织材料参数（更软，便于产生可见形变）
 TISSUE_YOUNG_MODULUS = 800.0
 TISSUE_POISSON_RATIO = 0.46
+# 病灶材料参数：ESD 场景下的早期消化道病灶/纤维化黏膜下层近似。
+# 当前 SOFA 网格仍为单连续组织体，病灶材料用于局部应力与节点反力导出。
+LESION_YOUNG_MODULUS = 3000.0
+LESION_POISSON_RATIO = 0.47
 # 分段常曲率（PCC）机器人参数
 PCC_SEGMENT_LENGTHS = [0.30, 0.30, 0.30, 0.30]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 0.45  # 1/m，聚焦在病灶周围画圆所需的小曲率工作空间
+PCC_CURVATURE_DOF = 4  # [ky_prox, ky_dist, kz_prox, kz_dist]，每个平面两段曲率可形成 S 型
+PCC_ACTION_DOF = PCC_CURVATURE_DOF + 1  # 再加一个沿 +X 插入/回撤自由度
 # 机器人基座初始偏移（左侧固定，主轴沿 +x 方向）
 # 初始 tip 在原基座附近 (0.10, -0.08)，负曲率时末端向组织/病灶方向弯曲。
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
@@ -39,6 +45,7 @@ TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
 TISSUE_GRID_MAX = np.array([0.25, -0.10, 0.06], dtype=np.float64)
 LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
 LESION_RADIUS = 0.025
+LESION_SURFACE_BAND = 0.006
 # 缆绳控制参数：每步曲率/插入增量（累积控制）。
 # 病灶圆轨迹所需曲率约在 +/-0.35 以内，较小增量可避免几步内甩出工作区。
 CURVATURE_DELTA_SCALE = 0.03
@@ -63,25 +70,57 @@ def build_line_edges(point_count):
     return np.stack([start_idx, end_idx], axis=1)
 
 
+def normalize_s_curve_curvature_command(curvature_command):
+    """
+    统一曲率命令格式。
+
+    新格式为 [ky_prox, ky_dist, kz_prox, kz_dist]：
+    - ky_prox/ky_dist 控制 X-Y 平面前半段/后半段弯曲
+    - kz_prox/kz_dist 控制 X-Z 平面前半段/后半段弯曲
+
+    兼容旧格式 [ky, kz]，会扩展为同向 C 型曲率 [ky, ky, kz, kz]。
+    """
+    curvature = np.asarray(curvature_command, dtype=np.float64).reshape(-1)
+    if curvature.size == 0:
+        curvature = np.zeros(PCC_CURVATURE_DOF, dtype=np.float64)
+    elif curvature.size == 1:
+        curvature = np.array([curvature[0], curvature[0], 0.0, 0.0], dtype=np.float64)
+    elif curvature.size == 2:
+        curvature = np.array([curvature[0], curvature[0], curvature[1], curvature[1]], dtype=np.float64)
+    elif curvature.size < PCC_CURVATURE_DOF:
+        curvature = np.pad(curvature, (0, PCC_CURVATURE_DOF - curvature.size))
+    else:
+        curvature = curvature[:PCC_CURVATURE_DOF]
+    curvature = np.clip(curvature, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE)
+
+    # 每个物理段同时存在 ky/kz，限制平面合成曲率，避免对角方向超过最大曲率。
+    for pair_indices in ((0, 2), (1, 3)):
+        pair = curvature[list(pair_indices)]
+        pair_norm = float(np.linalg.norm(pair))
+        if pair_norm > PCC_MAX_CURVATURE:
+            curvature[list(pair_indices)] = pair * (PCC_MAX_CURVATURE / max(pair_norm, 1e-8))
+    return curvature
+
+
+def segment_curvature_from_s_command(curvature_command, segment_index, segment_count):
+    split_index = max(1, segment_count // 2)
+    if segment_index < split_index:
+        return np.array([curvature_command[0], curvature_command[2]], dtype=np.float64)
+    return np.array([curvature_command[1], curvature_command[3]], dtype=np.float64)
+
+
 def generate_segmented_constant_curvature_points(curvature_command, insertion_offset=0.0):
     """
     生成固定基端的分段常曲率（PCC）中心线。
 
     Args:
-        curvature_command: 全局控制曲率，可以是标量 ky 或二维向量 [ky, kz]。
+        curvature_command: S 型曲率向量 [ky_prox, ky_dist, kz_prox, kz_dist]。
         insertion_offset: 沿 +X 方向的插入/回撤位移。
 
     Returns:
         np.ndarray: (N, 3) 机器人中心线点集
     """
-    curvature = np.asarray(curvature_command, dtype=np.float64).reshape(-1)
-    if curvature.size == 0:
-        curvature = np.zeros(2, dtype=np.float64)
-    elif curvature.size == 1:
-        curvature = np.array([curvature[0], 0.0], dtype=np.float64)
-    else:
-        curvature = curvature[:2]
-    curvature = np.clip(curvature, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE)
+    curvature = normalize_s_curve_curvature_command(curvature_command)
     base_position = PCC_BASE_OFFSET + np.array(
         [float(np.clip(insertion_offset, -INSERTION_LIMIT, INSERTION_LIMIT)), 0.0, 0.0],
         dtype=np.float64,
@@ -91,13 +130,14 @@ def generate_segmented_constant_curvature_points(curvature_command, insertion_of
     theta_z = 0.0
     current = points[0].copy()
 
-    for seg_len, seg_weight in zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS):
-        seg_curvature = curvature * seg_weight
+    segment_count = len(PCC_SEGMENT_LENGTHS)
+    for seg_idx, (seg_len, seg_weight) in enumerate(zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS)):
+        seg_curvature = segment_curvature_from_s_command(curvature, seg_idx, segment_count) * seg_weight
         ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
         for _ in range(PCC_POINTS_PER_SEGMENT):
             theta_y += seg_curvature[0] * ds
             theta_z += seg_curvature[1] * ds
-            # 主轴沿 +X。ky 控制 X-Y 平面弯曲，kz 控制 X-Z 平面弯曲。
+            # 主轴沿 +X。前/后半段分别使用独立曲率，允许同一平面 S 型弯曲。
             current[0] += np.cos(theta_y) * np.cos(theta_z) * ds
             current[1] += np.sin(theta_y) * ds
             current[2] += np.sin(theta_z) * ds
@@ -249,6 +289,157 @@ def compute_lesion_mask(rest_positions, lesion_center, lesion_radius):
         # 至少保留一个最近点，保证病灶指标可计算
         lesion_indices = np.array([int(np.argmin(dist))], dtype=np.int64)
     return lesion_indices
+
+
+def compute_lesion_surface_indices(rest_positions, lesion_center, lesion_radius, lesion_indices):
+    """
+    从病灶 ROI 中提取靠近球面外壳的节点，用于表面局部应力/反力导出。
+    """
+    if rest_positions.size == 0 or lesion_indices.size == 0:
+        return np.array([], dtype=np.int64)
+    lesion_rest_positions = rest_positions[lesion_indices]
+    dist = np.linalg.norm(lesion_rest_positions - lesion_center, axis=1)
+    inner_radius = max(0.0, lesion_radius - LESION_SURFACE_BAND)
+    surface_indices = lesion_indices[dist >= inner_radius]
+    if surface_indices.size == 0:
+        surface_indices = lesion_indices
+    return surface_indices.astype(np.int64)
+
+
+def build_lesion_point_data(
+    tissue_positions,
+    tissue_rest_positions,
+    lesion_indices,
+    lesion_surface_indices,
+):
+    """
+    构造写入 tissue VTK 的病灶局部场。
+
+    lesion_surface_stress_proxy:
+        病灶表面位移/半径得到的局部应变，再乘病灶材料杨氏模量。
+    lesion_nodal_reaction_proxy:
+        病灶节点等效刚度乘节点位移，用于估计病灶区域反力。
+    """
+    point_count = int(tissue_positions.shape[0])
+    lesion_roi = np.zeros(point_count, dtype=np.float64)
+    lesion_surface_roi = np.zeros(point_count, dtype=np.float64)
+    lesion_surface_stress_proxy = np.zeros(point_count, dtype=np.float64)
+    lesion_nodal_reaction_proxy = np.zeros(point_count, dtype=np.float64)
+
+    if (
+        point_count == 0
+        or tissue_rest_positions.size == 0
+        or lesion_indices.size == 0
+    ):
+        return {
+            "lesion_roi": lesion_roi,
+            "lesion_surface_roi": lesion_surface_roi,
+            "lesion_surface_stress_proxy": lesion_surface_stress_proxy,
+            "lesion_nodal_reaction_proxy": lesion_nodal_reaction_proxy,
+        }
+
+    lesion_indices = lesion_indices[lesion_indices < point_count]
+    lesion_surface_indices = lesion_surface_indices[lesion_surface_indices < point_count]
+    displacement_norm = np.linalg.norm(tissue_positions - tissue_rest_positions, axis=1)
+    char_length = max(LESION_RADIUS, 1e-8)
+    lesion_node_stiffness = LESION_YOUNG_MODULUS / char_length
+
+    lesion_roi[lesion_indices] = 1.0
+    lesion_surface_roi[lesion_surface_indices] = 1.0
+    lesion_surface_stress_proxy[lesion_surface_indices] = (
+        LESION_YOUNG_MODULUS * displacement_norm[lesion_surface_indices] / char_length
+    )
+    lesion_nodal_reaction_proxy[lesion_indices] = (
+        lesion_node_stiffness * displacement_norm[lesion_indices]
+    )
+
+    return {
+        "lesion_roi": lesion_roi,
+        "lesion_surface_roi": lesion_surface_roi,
+        "lesion_surface_stress_proxy": lesion_surface_stress_proxy,
+        "lesion_nodal_reaction_proxy": lesion_nodal_reaction_proxy,
+    }
+
+
+def default_lesion_local_metrics():
+    return {
+        "lesion_surface_stress_mean": 0.0,
+        "lesion_surface_stress_peak": 0.0,
+        "lesion_nodal_reaction_mean": 0.0,
+        "lesion_nodal_reaction_peak": 0.0,
+        "lesion_nodal_reaction_total": 0.0,
+        "lesion_contact_distance": 1.0,
+        "lesion_contact_force_mean": 0.0,
+        "lesion_contact_force_peak": 0.0,
+        "lesion_contact_force_total": 0.0,
+    }
+
+
+def compute_lesion_local_metrics(
+    tip_position,
+    tissue_positions,
+    tissue_rest_positions,
+    lesion_indices,
+    lesion_surface_indices,
+    contact_force_mean,
+    contact_force_peak,
+    contact_force_total,
+):
+    """
+    根据病灶表面局部应力和节点反力估计病灶区域接触力。
+    """
+    if (
+        tissue_positions.size == 0
+        or tissue_rest_positions.size == 0
+        or lesion_indices.size == 0
+    ):
+        return default_lesion_local_metrics()
+
+    point_data = build_lesion_point_data(
+        tissue_positions=tissue_positions,
+        tissue_rest_positions=tissue_rest_positions,
+        lesion_indices=lesion_indices,
+        lesion_surface_indices=lesion_surface_indices,
+    )
+    surface_indices = lesion_surface_indices
+    if surface_indices.size == 0:
+        surface_indices = lesion_indices
+
+    surface_stress = point_data["lesion_surface_stress_proxy"][surface_indices]
+    nodal_reaction = point_data["lesion_nodal_reaction_proxy"][lesion_indices]
+    surface_positions = tissue_positions[surface_indices]
+    surface_distances = np.linalg.norm(surface_positions - tip_position, axis=1)
+    lesion_contact_distance = float(np.min(surface_distances)) if surface_distances.size else 1.0
+
+    char_length = max(LESION_RADIUS, 1e-8)
+    weights = np.exp(-np.square(surface_distances / char_length))
+    surface_reaction = point_data["lesion_nodal_reaction_proxy"][surface_indices]
+    weight_mean = float(np.mean(weights)) if weights.size else 0.0
+    weight_peak = float(np.max(weights)) if weights.size else 0.0
+    lesion_contact_force_mean = max(
+        float(contact_force_mean) * weight_mean,
+        float(np.mean(surface_reaction)) if surface_reaction.size else 0.0,
+    )
+    lesion_contact_force_peak = max(
+        float(contact_force_peak) * weight_peak,
+        float(np.max(surface_reaction)) if surface_reaction.size else 0.0,
+    )
+    lesion_contact_force_total = max(
+        float(contact_force_total) * weight_mean,
+        float(np.sum(surface_reaction)) if surface_reaction.size else 0.0,
+    )
+
+    return {
+        "lesion_surface_stress_mean": float(np.mean(surface_stress)) if surface_stress.size else 0.0,
+        "lesion_surface_stress_peak": float(np.max(surface_stress)) if surface_stress.size else 0.0,
+        "lesion_nodal_reaction_mean": float(np.mean(nodal_reaction)) if nodal_reaction.size else 0.0,
+        "lesion_nodal_reaction_peak": float(np.max(nodal_reaction)) if nodal_reaction.size else 0.0,
+        "lesion_nodal_reaction_total": float(np.sum(nodal_reaction)) if nodal_reaction.size else 0.0,
+        "lesion_contact_distance": lesion_contact_distance,
+        "lesion_contact_force_mean": lesion_contact_force_mean,
+        "lesion_contact_force_peak": lesion_contact_force_peak,
+        "lesion_contact_force_total": lesion_contact_force_total,
+    }
 
 
 def compute_tissue_interaction_metrics(
@@ -411,7 +602,7 @@ def main():
 
     robot_dofs = root.SoftBody.dofs
     tissue_dofs = root.TargetTissue.dofs
-    current_curvature_cmd = np.zeros(2, dtype=np.float64)
+    current_curvature_cmd = np.zeros(PCC_CURVATURE_DOF, dtype=np.float64)
     current_insertion_cmd = 0.0
 
     robot_rest_positions = apply_robot_pcc_shape(
@@ -440,7 +631,19 @@ def main():
         lesion_center=lesion_center_ref,
         lesion_radius=LESION_RADIUS,
     )
+    lesion_surface_indices = compute_lesion_surface_indices(
+        tissue_rest_positions,
+        lesion_center=lesion_center_ref,
+        lesion_radius=LESION_RADIUS,
+        lesion_indices=lesion_indices,
+    )
     print(f"Lesion region nodes: {len(lesion_indices)}")
+    print(f"Lesion surface nodes: {len(lesion_surface_indices)}")
+    print(
+        "[SOFA] Lesion material proxy: "
+        f"E={LESION_YOUNG_MODULUS:.1f}, nu={LESION_POISSON_RATIO:.2f}; "
+        f"background tissue E={TISSUE_YOUNG_MODULUS:.1f}, nu={TISSUE_POISSON_RATIO:.2f}"
+    )
     baseline_force_level = (0.0, 0.0, 0.0)
 
     ctx = zmq.Context()
@@ -456,7 +659,12 @@ def main():
     with open(metrics_file, "w", encoding="utf-8") as f:
         f.write(
             "step,tip_x,tip_y,tip_z,lesion_distance,contact_distance,"
-            "contact_force_mean,contact_force_peak,contact_force_total\n"
+            "contact_force_mean,contact_force_peak,contact_force_total,"
+            "lesion_contact_distance,lesion_contact_force_mean,"
+            "lesion_contact_force_peak,lesion_contact_force_total,"
+            "lesion_surface_stress_mean,lesion_surface_stress_peak,"
+            "lesion_nodal_reaction_mean,lesion_nodal_reaction_peak,"
+            "lesion_nodal_reaction_total\n"
         )
     print("[SOFA] Headless Server Ready (Manual Export Mode)...")
     # SOFA_EXPORT_INTERVAL 可通过环境变量覆盖，便于平衡 IO 和可视化密度
@@ -475,7 +683,7 @@ def main():
                 # reset：重置场景、控制量与参考状态，用于 episode 开始
                 Sofa.Simulation.reset(root)
                 step_count = 0
-                current_curvature_cmd = np.zeros(2, dtype=np.float64)
+                current_curvature_cmd = np.zeros(PCC_CURVATURE_DOF, dtype=np.float64)
                 current_insertion_cmd = 0.0
                 robot_rest_positions = apply_robot_pcc_shape(
                     robot_dofs,
@@ -486,6 +694,17 @@ def main():
                 Sofa.Simulation.animate(root, 0.0001)
                 tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
                 rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
+                lesion_indices = compute_lesion_mask(
+                    tissue_rest_positions,
+                    lesion_center=lesion_center_ref,
+                    lesion_radius=LESION_RADIUS,
+                )
+                lesion_surface_indices = compute_lesion_surface_indices(
+                    tissue_rest_positions,
+                    lesion_center=lesion_center_ref,
+                    lesion_radius=LESION_RADIUS,
+                    lesion_indices=lesion_indices,
+                )
                 # 记录 reset 基线约束力，用于运行时剔除静态约束背景噪声
                 solver_forces = read_constraint_forces(root.constraint_solver)
                 if solver_forces.size > 0:
@@ -498,30 +717,32 @@ def main():
                 else:
                     baseline_force_level = (0.0, 0.0, 0.0)
             else:
-                # 执行一步控制：cable_disp 为曲率增量，累积后限幅
-                raw_cable_disp = np.asarray(cmd.get("cable_disp", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(-1)
+                # 执行一步控制：cable_disp 为曲率/插入增量，累积后限幅。
+                # 新格式：[ky_prox_delta, ky_dist_delta, kz_prox_delta, kz_dist_delta, insertion_delta]
+                raw_cable_disp = np.asarray(
+                    cmd.get("cable_disp", np.zeros(PCC_ACTION_DOF, dtype=np.float64)),
+                    dtype=np.float64,
+                ).reshape(-1)
                 if raw_cable_disp.size == 0:
-                    raw_cable_disp = np.zeros(3, dtype=np.float64)
-                elif raw_cable_disp.size < 3:
-                    raw_cable_disp = np.pad(raw_cable_disp, (0, 3 - raw_cable_disp.size))
+                    raw_cable_disp = np.zeros(PCC_ACTION_DOF, dtype=np.float64)
+                elif raw_cable_disp.size < PCC_ACTION_DOF:
+                    raw_cable_disp = np.pad(raw_cable_disp, (0, PCC_ACTION_DOF - raw_cable_disp.size))
                 else:
-                    raw_cable_disp = raw_cable_disp[:3]
+                    raw_cable_disp = raw_cable_disp[:PCC_ACTION_DOF]
                 curvature_delta = np.clip(
-                    raw_cable_disp[:2] * CURVATURE_DELTA_SCALE,
+                    raw_cable_disp[:PCC_CURVATURE_DOF] * CURVATURE_DELTA_SCALE,
                     -CURVATURE_DELTA_LIMIT,
                     CURVATURE_DELTA_LIMIT,
                 )
                 insertion_delta = float(
                     np.clip(
-                        raw_cable_disp[2] * INSERTION_DELTA_SCALE,
+                        raw_cable_disp[PCC_CURVATURE_DOF] * INSERTION_DELTA_SCALE,
                         -INSERTION_DELTA_LIMIT,
                         INSERTION_DELTA_LIMIT,
                     )
                 )
-                current_curvature_cmd = np.clip(
-                    current_curvature_cmd + curvature_delta,
-                    -PCC_MAX_CURVATURE,
-                    PCC_MAX_CURVATURE,
+                current_curvature_cmd = normalize_s_curve_curvature_command(
+                    current_curvature_cmd + curvature_delta
                 )
                 current_insertion_cmd = float(
                     np.clip(
@@ -530,20 +751,11 @@ def main():
                         INSERTION_LIMIT,
                     )
                 )
-                current_curvature_cmd = np.asarray(current_curvature_cmd, dtype=np.float64)
                 apply_robot_pcc_shape(
                     robot_dofs,
                     curvature_command=current_curvature_cmd,
                     insertion_offset=current_insertion_cmd,
                 )
-                curvature_magnitude = float(np.linalg.norm(current_curvature_cmd))
-                if curvature_magnitude > PCC_MAX_CURVATURE:
-                    current_curvature_cmd *= PCC_MAX_CURVATURE / max(curvature_magnitude, 1e-8)
-                    apply_robot_pcc_shape(
-                        robot_dofs,
-                        curvature_command=current_curvature_cmd,
-                        insertion_offset=current_insertion_cmd,
-                    )
 
                 # 多子步物理积分，使组织形变更充分
                 dt = float(root.dt.value)
@@ -562,7 +774,17 @@ def main():
                         robot_file = os.path.join(robot_vtk_dir, f"frame_{step_count:04d}.vtk")
                         robot_mesh.write(robot_file)
                     if len(tissue_points) > 0:
-                        tissue_mesh = meshio.Mesh(points=tissue_points, cells=tissue_topo_cells)
+                        tissue_point_data = build_lesion_point_data(
+                            tissue_positions=tissue_points,
+                            tissue_rest_positions=tissue_rest_positions,
+                            lesion_indices=lesion_indices,
+                            lesion_surface_indices=lesion_surface_indices,
+                        )
+                        tissue_mesh = meshio.Mesh(
+                            points=tissue_points,
+                            cells=tissue_topo_cells,
+                            point_data=tissue_point_data,
+                        )
                         tissue_file = os.path.join(tissue_vtk_dir, f"frame_{step_count:04d}.vtk")
                         tissue_mesh.write(tissue_file)
                 except Exception as e:
@@ -582,6 +804,7 @@ def main():
                     "contact_distance": 1.0,
                     "lesion_center": [0.0, 0.0, 0.0],
                 }
+                lesion_local_metrics = default_lesion_local_metrics()
             else:
                 tip_np = robot_positions[-1]
                 tip_position = tip_np.tolist()
@@ -608,6 +831,17 @@ def main():
                 contact_force_mean = 0.0
                 contact_force_peak = 0.0
                 contact_force_total = 0.0
+            else:
+                lesion_local_metrics = compute_lesion_local_metrics(
+                    tip_position=robot_positions[-1],
+                    tissue_positions=tissue_positions,
+                    tissue_rest_positions=tissue_rest_positions,
+                    lesion_indices=lesion_indices,
+                    lesion_surface_indices=lesion_surface_indices,
+                    contact_force_mean=contact_force_mean,
+                    contact_force_peak=contact_force_peak,
+                    contact_force_total=contact_force_total,
+                )
 
             if step_count % export_interval == 0:
                 try:
@@ -621,7 +855,16 @@ def main():
                             f"{float(lesion_metrics['contact_distance']):.8f},"
                             f"{contact_force_mean:.8f},"
                             f"{contact_force_peak:.8f},"
-                            f"{contact_force_total:.8f}\n"
+                            f"{contact_force_total:.8f},"
+                            f"{lesion_local_metrics['lesion_contact_distance']:.8f},"
+                            f"{lesion_local_metrics['lesion_contact_force_mean']:.8f},"
+                            f"{lesion_local_metrics['lesion_contact_force_peak']:.8f},"
+                            f"{lesion_local_metrics['lesion_contact_force_total']:.8f},"
+                            f"{lesion_local_metrics['lesion_surface_stress_mean']:.8f},"
+                            f"{lesion_local_metrics['lesion_surface_stress_peak']:.8f},"
+                            f"{lesion_local_metrics['lesion_nodal_reaction_mean']:.8f},"
+                            f"{lesion_local_metrics['lesion_nodal_reaction_peak']:.8f},"
+                            f"{lesion_local_metrics['lesion_nodal_reaction_total']:.8f}\n"
                         )
                 except Exception as e:
                     print(f"Frame Metrics Export Error: {e}")
@@ -641,6 +884,15 @@ def main():
                 "contact_force_peak": contact_force_peak,
                 "contact_force_total": contact_force_total,
                 "lesion_center": lesion_metrics["lesion_center"],
+                "lesion_surface_stress_mean": lesion_local_metrics["lesion_surface_stress_mean"],
+                "lesion_surface_stress_peak": lesion_local_metrics["lesion_surface_stress_peak"],
+                "lesion_nodal_reaction_mean": lesion_local_metrics["lesion_nodal_reaction_mean"],
+                "lesion_nodal_reaction_peak": lesion_local_metrics["lesion_nodal_reaction_peak"],
+                "lesion_nodal_reaction_total": lesion_local_metrics["lesion_nodal_reaction_total"],
+                "lesion_contact_distance": lesion_local_metrics["lesion_contact_distance"],
+                "lesion_contact_force_mean": lesion_local_metrics["lesion_contact_force_mean"],
+                "lesion_contact_force_peak": lesion_local_metrics["lesion_contact_force_peak"],
+                "lesion_contact_force_total": lesion_local_metrics["lesion_contact_force_total"],
             }
             sock.send_string(json.dumps(reply))
     finally:

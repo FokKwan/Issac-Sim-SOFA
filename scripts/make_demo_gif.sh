@@ -159,7 +159,13 @@ def load_frame_metrics(path):
                     "contact_force_peak": float(row.get("contact_force_peak", 0.0)),
                     "contact_force_mean": float(row.get("contact_force_mean", 0.0)),
                     "contact_force_total": float(row.get("contact_force_total", 0.0)),
+                    "lesion_contact_force_peak": float(row.get("lesion_contact_force_peak", row.get("contact_force_peak", 0.0))),
+                    "lesion_contact_force_mean": float(row.get("lesion_contact_force_mean", row.get("contact_force_mean", 0.0))),
+                    "lesion_contact_force_total": float(row.get("lesion_contact_force_total", row.get("contact_force_total", 0.0))),
+                    "lesion_surface_stress_peak": float(row.get("lesion_surface_stress_peak", 0.0)),
+                    "lesion_nodal_reaction_peak": float(row.get("lesion_nodal_reaction_peak", 0.0)),
                     "contact_distance": float(row.get("contact_distance", 1.0)),
+                    "lesion_contact_distance": float(row.get("lesion_contact_distance", row.get("contact_distance", 1.0))),
                 }
             except (KeyError, TypeError, ValueError):
                 continue
@@ -195,7 +201,10 @@ for step in selected_ids:
         continue
     robot_point_clouds.append((robot_path, robot_points))
     frame_contact_values.append(
-        metrics_by_id.get(step, {}).get("contact_force_peak", 0.0)
+        metrics_by_id.get(step, {}).get(
+            "lesion_contact_force_peak",
+            metrics_by_id.get(step, {}).get("contact_force_peak", 0.0),
+        )
     )
     mins = np.minimum(mins, robot_points.min(axis=0))
     maxs = np.maximum(maxs, robot_points.max(axis=0))
@@ -287,7 +296,7 @@ robot_scatter = ax.scatter(
 )
 if use_contact_colors:
     colorbar = fig.colorbar(robot_scatter, ax=ax, shrink=0.65, pad=0.08)
-    colorbar.set_label("Contact force peak")
+    colorbar.set_label("Lesion contact force peak")
 tissue_scatter = None
 first_tissue_points = None
 if tissue_point_clouds:
@@ -348,7 +357,7 @@ def update(frame_idx):
             artists.append(tissue_scatter)
     contact_text = ""
     if use_contact_colors:
-        contact_text = f" | contact_peak={frame_contact_values[frame_idx]:.4f}"
+        contact_text = f" | lesion_contact_peak={frame_contact_values[frame_idx]:.4f}"
     ax.set_title(
         f"SOFA deformation demo ({frame_idx + 1}/{len(robot_point_clouds)}) "
         f"| motion_scale={motion_scale:.2f}{contact_text}"
@@ -377,12 +386,12 @@ print(
 )
 if use_contact_colors:
     print(
-        "[INFO] Contact force peak stats: "
+        "[INFO] Lesion contact force peak stats: "
         f"min={min(frame_contact_values):.6f}, max={max(frame_contact_values):.6f}, "
         f"mean={float(np.mean(frame_contact_values)):.6f}"
     )
 elif metrics_by_id:
-    print("[INFO] Metrics CSV found, but all contact_force_peak values are zero.")
+    print("[INFO] Metrics CSV found, but all lesion_contact_force_peak values are zero.")
 print(
     "[INFO] Tip displacement stats (raw meters): "
     f"min={min(tip_displacements):.6f}, max={max(tip_displacements):.6f}, "

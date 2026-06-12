@@ -22,7 +22,8 @@ class SoftSofaEnv(gym.Env):
         self.max_episode_steps = int(max_episode_steps)
         self.t = 0
         # 归一化动作到曲率/插入增量的缩放系数：
-        # SOFA 每步累积 cable_disp = [ky_delta, kz_delta, insertion_delta] * action_scale。
+        # SOFA 每步累积 cable_disp =
+        # [ky_prox_delta, ky_dist_delta, kz_prox_delta, kz_dist_delta, insertion_delta] * action_scale。
         self.action_scale = 1.0
         # 安全阈值参数（用于 done 判定，略放宽以允许更大动作）
         self.max_von_mises = 3200.0
@@ -45,8 +46,8 @@ class SoftSofaEnv(gym.Env):
         self.time_penalty = 0.002
 
         # 1. 定义动作空间 (Action Space)
-        # 标准化三维动作：[ky_delta, kz_delta, insertion_delta]，发送前再做尺度映射
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+        # 标准化五维动作：XY/XZ 平面各两个曲率段，可在每个平面形成 S 型弯曲。
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
 
         # 2. 定义观测空间 (Observation Space)
         # 每个键都需与 _build_obs 完全对应。
@@ -57,6 +58,8 @@ class SoftSofaEnv(gym.Env):
         # - lesion_strain/tissue_strain: 病灶/组织应变
         # - contact_distance: 末端到组织最近距离
         # - contact_force_mean/peak/total: 约束求解器接触力统计
+        # - lesion_contact_force_*: 由病灶表面应力和节点反力估计的局部接触力
+        # - lesion_surface_stress_* / lesion_nodal_reaction_*: 病灶表面局部场统计
         # - lesion_center: 病灶中心位置
         # - circle_target: 当前相位下末端应追踪的圆周目标点
         # - circle_phase: 当前圆周相位 [0, 2pi]
@@ -72,6 +75,15 @@ class SoftSofaEnv(gym.Env):
             "contact_force_mean": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "contact_force_peak": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "contact_force_total": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_contact_distance": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_contact_force_mean": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_contact_force_peak": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_contact_force_total": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_surface_stress_mean": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_surface_stress_peak": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_nodal_reaction_mean": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_nodal_reaction_peak": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
+            "lesion_nodal_reaction_total": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "lesion_center": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             "circle_target": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             "circle_phase": spaces.Box(low=0.0, high=2.0 * np.pi, shape=(1,), dtype=np.float32),
@@ -106,11 +118,11 @@ class SoftSofaEnv(gym.Env):
     def step(self, action):
         self.t += 1
 
-        # SB3 输出一般是 ndarray，这里统一为三维向量并裁剪到 [-1, 1]
+        # SB3 输出一般是 ndarray，这里统一为五维向量并裁剪到 [-1, 1]
         normalized_action = np.asarray(action, dtype=np.float32).reshape(-1)
-        if normalized_action.size < 3:
-            normalized_action = np.pad(normalized_action, (0, 3 - normalized_action.size))
-        normalized_action = np.clip(normalized_action[:3], -1.0, 1.0)
+        if normalized_action.size < 5:
+            normalized_action = np.pad(normalized_action, (0, 5 - normalized_action.size))
+        normalized_action = np.clip(normalized_action[:5], -1.0, 1.0)
         # 动作映射到 SOFA 曲率/插入增量（累积控制）
         cable_disp = normalized_action * self.action_scale
         sofa_obs = self.sofa.step(cable_disp=cable_disp)
@@ -125,6 +137,7 @@ class SoftSofaEnv(gym.Env):
                 "lesion_distance": float(self._last_obs["lesion_distance"][0]),
                 "circle_error": float(self._last_obs["circle_error"][0]),
                 "contact_force_peak": float(self._last_obs["contact_force_peak"][0]),
+                "lesion_contact_force_peak": float(self._last_obs["lesion_contact_force_peak"][0]),
                 "success": False,
             }
             return self._last_obs, -100.0, True, False, info
@@ -152,6 +165,15 @@ class SoftSofaEnv(gym.Env):
             "contact_force_mean": float(obs["contact_force_mean"][0]),
             "contact_force_peak": float(obs["contact_force_peak"][0]),
             "contact_force_total": float(obs["contact_force_total"][0]),
+            "lesion_contact_distance": float(obs["lesion_contact_distance"][0]),
+            "lesion_contact_force_mean": float(obs["lesion_contact_force_mean"][0]),
+            "lesion_contact_force_peak": float(obs["lesion_contact_force_peak"][0]),
+            "lesion_contact_force_total": float(obs["lesion_contact_force_total"][0]),
+            "lesion_surface_stress_mean": float(obs["lesion_surface_stress_mean"][0]),
+            "lesion_surface_stress_peak": float(obs["lesion_surface_stress_peak"][0]),
+            "lesion_nodal_reaction_mean": float(obs["lesion_nodal_reaction_mean"][0]),
+            "lesion_nodal_reaction_peak": float(obs["lesion_nodal_reaction_peak"][0]),
+            "lesion_nodal_reaction_total": float(obs["lesion_nodal_reaction_total"][0]),
             "success": success,
             "distance_progress": self._last_progress,
             "tip_displacement": float(sofa_obs.get("tip_displacement", 0.0)),
@@ -189,6 +211,15 @@ class SoftSofaEnv(gym.Env):
             "contact_force_mean": np.array([float(sofa_obs.get("contact_force_mean", 0.0))], dtype=np.float32),
             "contact_force_peak": np.array([float(sofa_obs.get("contact_force_peak", 0.0))], dtype=np.float32),
             "contact_force_total": np.array([float(sofa_obs.get("contact_force_total", 0.0))], dtype=np.float32),
+            "lesion_contact_distance": np.array([float(sofa_obs.get("lesion_contact_distance", 1.0))], dtype=np.float32),
+            "lesion_contact_force_mean": np.array([float(sofa_obs.get("lesion_contact_force_mean", 0.0))], dtype=np.float32),
+            "lesion_contact_force_peak": np.array([float(sofa_obs.get("lesion_contact_force_peak", 0.0))], dtype=np.float32),
+            "lesion_contact_force_total": np.array([float(sofa_obs.get("lesion_contact_force_total", 0.0))], dtype=np.float32),
+            "lesion_surface_stress_mean": np.array([float(sofa_obs.get("lesion_surface_stress_mean", 0.0))], dtype=np.float32),
+            "lesion_surface_stress_peak": np.array([float(sofa_obs.get("lesion_surface_stress_peak", 0.0))], dtype=np.float32),
+            "lesion_nodal_reaction_mean": np.array([float(sofa_obs.get("lesion_nodal_reaction_mean", 0.0))], dtype=np.float32),
+            "lesion_nodal_reaction_peak": np.array([float(sofa_obs.get("lesion_nodal_reaction_peak", 0.0))], dtype=np.float32),
+            "lesion_nodal_reaction_total": np.array([float(sofa_obs.get("lesion_nodal_reaction_total", 0.0))], dtype=np.float32),
             "lesion_center": lesion_center,
             "circle_target": circle_target.astype(np.float32),
             "circle_phase": np.array([circle_phase], dtype=np.float32),
@@ -207,7 +238,10 @@ class SoftSofaEnv(gym.Env):
         radial_distance = float(np.linalg.norm(tip_pos[[0, 2]] - lesion_center[[0, 2]]))
         radial_error = abs(radial_distance - self.circle_radius)
         radial_penalty = self.radial_gain * radial_error
-        contact_force_peak = float(obs["contact_force_peak"][0])
+        contact_force_peak = max(
+            float(obs["contact_force_peak"][0]),
+            float(obs["lesion_contact_force_peak"][0]),
+        )
         safety_penalty = (
             0.03 * float(obs["von_mises"][0])
             + 0.05 * float(obs["avg_strain"][0])
@@ -233,7 +267,10 @@ class SoftSofaEnv(gym.Env):
             or obs["avg_strain"][0] > self.max_avg_strain
             or obs["tissue_strain"][0] > self.max_tissue_strain
             or obs["lesion_strain"][0] > self.max_lesion_strain
-            or obs["contact_force_peak"][0] > 3.0 * self.max_contact_force
+            or max(
+                obs["contact_force_peak"][0],
+                obs["lesion_contact_force_peak"][0],
+            ) > 3.0 * self.max_contact_force
         )
 
     def _is_success(self, obs):
@@ -267,6 +304,15 @@ class SoftSofaEnv(gym.Env):
             "contact_force_mean": 0.0,
             "contact_force_peak": 0.0,
             "contact_force_total": 0.0,
+            "lesion_contact_distance": 1.0,
+            "lesion_contact_force_mean": 0.0,
+            "lesion_contact_force_peak": 0.0,
+            "lesion_contact_force_total": 0.0,
+            "lesion_surface_stress_mean": 0.0,
+            "lesion_surface_stress_peak": 0.0,
+            "lesion_nodal_reaction_mean": 0.0,
+            "lesion_nodal_reaction_peak": 0.0,
+            "lesion_nodal_reaction_total": 0.0,
             "lesion_center": [0.08, -0.14, 0.0],
         }
 
@@ -285,6 +331,15 @@ class SoftSofaEnv(gym.Env):
             "contact_force_mean",
             "contact_force_peak",
             "contact_force_total",
+            "lesion_contact_distance",
+            "lesion_contact_force_mean",
+            "lesion_contact_force_peak",
+            "lesion_contact_force_total",
+            "lesion_surface_stress_mean",
+            "lesion_surface_stress_peak",
+            "lesion_nodal_reaction_mean",
+            "lesion_nodal_reaction_peak",
+            "lesion_nodal_reaction_total",
             "lesion_center",
         )
         return all(key in sofa_obs for key in required_keys)

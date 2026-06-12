@@ -11,22 +11,53 @@ PCC_SEGMENT_LENGTHS = [0.30, 0.30, 0.30, 0.30]
 PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 0.45
+PCC_CURVATURE_DOF = 4
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
 LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
 INSERTION_LIMIT = 0.08
 
 
-def generate_tip(curvature_command):
-    command = np.asarray(curvature_command, dtype=np.float64).reshape(3)
-    curvature = command[:2]
-    insertion_offset = float(np.clip(command[2], -INSERTION_LIMIT, INSERTION_LIMIT))
+def normalize_s_curve_curvature_command(curvature_command):
+    curvature = np.asarray(curvature_command, dtype=np.float64).reshape(-1)
+    if curvature.size == 0:
+        curvature = np.zeros(PCC_CURVATURE_DOF, dtype=np.float64)
+    elif curvature.size == 1:
+        curvature = np.array([curvature[0], curvature[0], 0.0, 0.0], dtype=np.float64)
+    elif curvature.size == 2:
+        curvature = np.array([curvature[0], curvature[0], curvature[1], curvature[1]], dtype=np.float64)
+    elif curvature.size < PCC_CURVATURE_DOF:
+        curvature = np.pad(curvature, (0, PCC_CURVATURE_DOF - curvature.size))
+    else:
+        curvature = curvature[:PCC_CURVATURE_DOF]
     curvature = np.clip(curvature, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE)
+    for pair_indices in ((0, 2), (1, 3)):
+        pair = curvature[list(pair_indices)]
+        pair_norm = float(np.linalg.norm(pair))
+        if pair_norm > PCC_MAX_CURVATURE:
+            curvature[list(pair_indices)] = pair * (PCC_MAX_CURVATURE / max(pair_norm, 1e-8))
+    return curvature
+
+
+def segment_curvature_from_s_command(curvature_command, segment_index, segment_count):
+    split_index = max(1, segment_count // 2)
+    if segment_index < split_index:
+        return np.array([curvature_command[0], curvature_command[2]], dtype=np.float64)
+    return np.array([curvature_command[1], curvature_command[3]], dtype=np.float64)
+
+
+def generate_tip(curvature_command):
+    command = np.asarray(curvature_command, dtype=np.float64).reshape(-1)
+    if command.size < PCC_CURVATURE_DOF + 1:
+        command = np.pad(command, (0, PCC_CURVATURE_DOF + 1 - command.size))
+    curvature = normalize_s_curve_curvature_command(command[:PCC_CURVATURE_DOF])
+    insertion_offset = float(np.clip(command[PCC_CURVATURE_DOF], -INSERTION_LIMIT, INSERTION_LIMIT))
     theta_y = 0.0
     theta_z = 0.0
     current = PCC_BASE_OFFSET + np.array([insertion_offset, 0.0, 0.0], dtype=np.float64)
 
-    for seg_len, seg_weight in zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS):
-        seg_curvature = curvature * seg_weight
+    segment_count = len(PCC_SEGMENT_LENGTHS)
+    for seg_idx, (seg_len, seg_weight) in enumerate(zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS)):
+        seg_curvature = segment_curvature_from_s_command(curvature, seg_idx, segment_count) * seg_weight
         ds = seg_len / float(PCC_POINTS_PER_SEGMENT)
         for _ in range(PCC_POINTS_PER_SEGMENT):
             theta_y += seg_curvature[0] * ds
@@ -60,8 +91,9 @@ def main():
     for ky in curvature_values:
         for kz in curvature_values:
             for insertion_offset in insertion_values:
-                commands.append((ky, kz, insertion_offset))
-                tips.append(generate_tip((ky, kz, insertion_offset)))
+                command = (ky, ky, kz, kz, insertion_offset)
+                commands.append(command)
+                tips.append(generate_tip(command))
     tips = np.asarray(tips)
     commands = np.asarray(commands)
 
@@ -89,9 +121,11 @@ def main():
     print(f"min_error={errors.min():.6f}")
     print(
         "best_curvature_range="
-        f"ky[{best_commands[:, 0].min():.4f},{best_commands[:, 0].max():.4f}] "
-        f"kz[{best_commands[:, 1].min():.4f},{best_commands[:, 1].max():.4f}] "
-        f"insertion[{best_commands[:, 2].min():.4f},{best_commands[:, 2].max():.4f}]"
+        f"ky_prox[{best_commands[:, 0].min():.4f},{best_commands[:, 0].max():.4f}] "
+        f"ky_dist[{best_commands[:, 1].min():.4f},{best_commands[:, 1].max():.4f}] "
+        f"kz_prox[{best_commands[:, 2].min():.4f},{best_commands[:, 2].max():.4f}] "
+        f"kz_dist[{best_commands[:, 3].min():.4f},{best_commands[:, 3].max():.4f}] "
+        f"insertion[{best_commands[:, 4].min():.4f},{best_commands[:, 4].max():.4f}]"
     )
     if errors.max() <= args.tolerance:
         print("PASS: every sampled circle target is inside the reachable workspace tolerance.")
