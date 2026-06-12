@@ -178,6 +178,9 @@ class SoftSofaEnv(gym.Env):
             "success": success,
             "distance_progress": self._last_progress,
             "tip_displacement": float(sofa_obs.get("tip_displacement", 0.0)),
+            "tip_step_displacement": float(sofa_obs.get("tip_step_displacement", 0.0)),
+            "tip_step_speed": float(sofa_obs.get("tip_step_speed", 0.0)),
+            "tip_velocity_limited": bool(sofa_obs.get("tip_velocity_limited", False)),
             "communication_error": False,
         }
 

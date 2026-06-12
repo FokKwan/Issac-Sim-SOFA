@@ -53,6 +53,8 @@ CURVATURE_DELTA_LIMIT = 0.04
 INSERTION_DELTA_SCALE = 0.01
 INSERTION_DELTA_LIMIT = 0.015
 INSERTION_LIMIT = 0.08
+# tip 端限速：单个 RL step 内最大几何位移，避免曲率/插入命令造成末端突跳。
+TIP_MAX_STEP_DISPLACEMENT = 0.006
 # 每个 RL step 执行的物理子步数，提升组织响应幅度
 PHYSICS_SUBSTEPS = 5
 # VTK 导出默认间隔（每 N 个仿真 step 导出一次）。
@@ -577,6 +579,57 @@ def apply_robot_pcc_shape(robot_dofs, curvature_command, insertion_offset=0.0):
     robot_dofs.position.value = points.tolist()
     return points
 
+
+def limit_tip_step_motion(
+    previous_curvature,
+    previous_insertion,
+    target_curvature,
+    target_insertion,
+    current_tip_position,
+):
+    """
+    限制单个控制 step 内的 tip 几何位移，避免速度突变。
+    """
+    target_points = generate_segmented_constant_curvature_points(
+        curvature_command=target_curvature,
+        insertion_offset=target_insertion,
+    )
+    target_tip_step = float(np.linalg.norm(target_points[-1] - current_tip_position))
+    if target_tip_step <= TIP_MAX_STEP_DISPLACEMENT:
+        return target_curvature, target_insertion, target_tip_step, False
+
+    low = 0.0
+    high = 1.0
+    limited_curvature = np.asarray(previous_curvature, dtype=np.float64)
+    limited_insertion = float(previous_insertion)
+    limited_tip_step = 0.0
+    for _ in range(12):
+        alpha = 0.5 * (low + high)
+        candidate_curvature = normalize_s_curve_curvature_command(
+            previous_curvature + alpha * (target_curvature - previous_curvature)
+        )
+        candidate_insertion = float(
+            np.clip(
+                previous_insertion + alpha * (target_insertion - previous_insertion),
+                -INSERTION_LIMIT,
+                INSERTION_LIMIT,
+            )
+        )
+        candidate_points = generate_segmented_constant_curvature_points(
+            curvature_command=candidate_curvature,
+            insertion_offset=candidate_insertion,
+        )
+        candidate_tip_step = float(np.linalg.norm(candidate_points[-1] - current_tip_position))
+        if candidate_tip_step <= TIP_MAX_STEP_DISPLACEMENT:
+            low = alpha
+            limited_curvature = candidate_curvature
+            limited_insertion = candidate_insertion
+            limited_tip_step = candidate_tip_step
+        else:
+            high = alpha
+    return limited_curvature, limited_insertion, limited_tip_step, True
+
+
 def main():
     """SOFA headless 服务主循环。"""
     root = Sofa.Core.Node("root")
@@ -672,6 +725,9 @@ def main():
     print(f"[SOFA] Export interval: every {export_interval} steps")
 
     step_count = 0
+    tip_step_displacement = 0.0
+    tip_step_speed = 0.0
+    tip_velocity_limited = False
 
     try:
         while True:
@@ -683,6 +739,9 @@ def main():
                 # reset：重置场景、控制量与参考状态，用于 episode 开始
                 Sofa.Simulation.reset(root)
                 step_count = 0
+                tip_step_displacement = 0.0
+                tip_step_speed = 0.0
+                tip_velocity_limited = False
                 current_curvature_cmd = np.zeros(PCC_CURVATURE_DOF, dtype=np.float64)
                 current_insertion_cmd = 0.0
                 robot_rest_positions = apply_robot_pcc_shape(
@@ -741,15 +800,28 @@ def main():
                         INSERTION_DELTA_LIMIT,
                     )
                 )
-                current_curvature_cmd = normalize_s_curve_curvature_command(
+                target_curvature_cmd = normalize_s_curve_curvature_command(
                     current_curvature_cmd + curvature_delta
                 )
-                current_insertion_cmd = float(
+                target_insertion_cmd = float(
                     np.clip(
                         current_insertion_cmd + insertion_delta,
                         -INSERTION_LIMIT,
                         INSERTION_LIMIT,
                     )
+                )
+                current_tip_position = np.array(robot_dofs.position.value, dtype=np.float64)[-1]
+                (
+                    current_curvature_cmd,
+                    current_insertion_cmd,
+                    tip_step_displacement,
+                    tip_velocity_limited,
+                ) = limit_tip_step_motion(
+                    previous_curvature=current_curvature_cmd,
+                    previous_insertion=current_insertion_cmd,
+                    target_curvature=target_curvature_cmd,
+                    target_insertion=target_insertion_cmd,
+                    current_tip_position=current_tip_position,
                 )
                 apply_robot_pcc_shape(
                     robot_dofs,
@@ -761,6 +833,7 @@ def main():
                 dt = float(root.dt.value)
                 for _ in range(PHYSICS_SUBSTEPS):
                     Sofa.Simulation.animate(root, dt)
+                tip_step_speed = tip_step_displacement / max(dt * PHYSICS_SUBSTEPS, 1e-8)
                 step_count += 1
 
             # 周期导出 VTK 供 ParaView / GIF 可视化
@@ -831,6 +904,9 @@ def main():
                 contact_force_mean = 0.0
                 contact_force_peak = 0.0
                 contact_force_total = 0.0
+                tip_step_displacement = 0.0
+                tip_step_speed = 0.0
+                tip_velocity_limited = False
             else:
                 lesion_local_metrics = compute_lesion_local_metrics(
                     tip_position=robot_positions[-1],
@@ -874,6 +950,9 @@ def main():
                 "step": step_count,
                 "tip_position": tip_position,
                 "tip_displacement": tip_displacement,
+                "tip_step_displacement": tip_step_displacement,
+                "tip_step_speed": tip_step_speed,
+                "tip_velocity_limited": tip_velocity_limited,
                 "von_mises": von_mises,
                 "avg_strain": avg_strain,
                 "lesion_distance": lesion_metrics["lesion_distance"],
