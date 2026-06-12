@@ -39,10 +39,13 @@ TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
 TISSUE_GRID_MAX = np.array([0.25, -0.10, 0.06], dtype=np.float64)
 LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
 LESION_RADIUS = 0.025
-# 缆绳控制参数：每步曲率增量（累积控制）。
+# 缆绳控制参数：每步曲率/插入增量（累积控制）。
 # 病灶圆轨迹所需曲率约在 +/-0.35 以内，较小增量可避免几步内甩出工作区。
 CURVATURE_DELTA_SCALE = 0.03
 CURVATURE_DELTA_LIMIT = 0.04
+INSERTION_DELTA_SCALE = 0.01
+INSERTION_DELTA_LIMIT = 0.015
+INSERTION_LIMIT = 0.08
 # 每个 RL step 执行的物理子步数，提升组织响应幅度
 PHYSICS_SUBSTEPS = 5
 # VTK 导出默认间隔（每 N 个仿真 step 导出一次）。
@@ -60,12 +63,13 @@ def build_line_edges(point_count):
     return np.stack([start_idx, end_idx], axis=1)
 
 
-def generate_segmented_constant_curvature_points(curvature_command):
+def generate_segmented_constant_curvature_points(curvature_command, insertion_offset=0.0):
     """
     生成固定基端的分段常曲率（PCC）中心线。
 
     Args:
         curvature_command: 全局控制曲率，可以是标量 ky 或二维向量 [ky, kz]。
+        insertion_offset: 沿 +X 方向的插入/回撤位移。
 
     Returns:
         np.ndarray: (N, 3) 机器人中心线点集
@@ -78,7 +82,11 @@ def generate_segmented_constant_curvature_points(curvature_command):
     else:
         curvature = curvature[:2]
     curvature = np.clip(curvature, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE)
-    points = [PCC_BASE_OFFSET.copy()]
+    base_position = PCC_BASE_OFFSET + np.array(
+        [float(np.clip(insertion_offset, -INSERTION_LIMIT, INSERTION_LIMIT)), 0.0, 0.0],
+        dtype=np.float64,
+    )
+    points = [base_position.copy()]
     theta_y = 0.0
     theta_z = 0.0
     current = points[0].copy()
@@ -359,18 +367,22 @@ def read_constraint_forces(constraint_solver):
     return np.asarray(raw_values, dtype=np.float64).reshape(-1)
 
 
-def apply_robot_pcc_shape(robot_dofs, curvature_command):
+def apply_robot_pcc_shape(robot_dofs, curvature_command, insertion_offset=0.0):
     """
     按分段常曲率模型更新机器人中心线点位（固定基端）。
 
     Args:
         robot_dofs: SOFA MechanicalObject
         curvature_command: 目标曲率控制量
+        insertion_offset: 沿 +X 方向的插入/回撤位移
 
     Returns:
         np.ndarray: 更新后的中心线点集
     """
-    points = generate_segmented_constant_curvature_points(curvature_command=curvature_command)
+    points = generate_segmented_constant_curvature_points(
+        curvature_command=curvature_command,
+        insertion_offset=insertion_offset,
+    )
     robot_dofs.position.value = points.tolist()
     return points
 
@@ -400,8 +412,13 @@ def main():
     robot_dofs = root.SoftBody.dofs
     tissue_dofs = root.TargetTissue.dofs
     current_curvature_cmd = np.zeros(2, dtype=np.float64)
+    current_insertion_cmd = 0.0
 
-    robot_rest_positions = apply_robot_pcc_shape(robot_dofs, curvature_command=0.0)
+    robot_rest_positions = apply_robot_pcc_shape(
+        robot_dofs,
+        curvature_command=0.0,
+        insertion_offset=0.0,
+    )
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
     rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
     initial_clearance = compute_point_cloud_aabb_clearance(
@@ -435,6 +452,12 @@ def main():
     tissue_vtk_dir = os.path.join("vtk_output", "tissue")
     os.makedirs(robot_vtk_dir, exist_ok=True)
     os.makedirs(tissue_vtk_dir, exist_ok=True)
+    metrics_file = os.path.join("vtk_output", "frame_metrics.csv")
+    with open(metrics_file, "w", encoding="utf-8") as f:
+        f.write(
+            "step,tip_x,tip_y,tip_z,lesion_distance,contact_distance,"
+            "contact_force_mean,contact_force_peak,contact_force_total\n"
+        )
     print("[SOFA] Headless Server Ready (Manual Export Mode)...")
     # SOFA_EXPORT_INTERVAL 可通过环境变量覆盖，便于平衡 IO 和可视化密度
     export_interval = max(1, int(os.environ.get("SOFA_EXPORT_INTERVAL", str(DEFAULT_EXPORT_INTERVAL))))
@@ -453,7 +476,12 @@ def main():
                 Sofa.Simulation.reset(root)
                 step_count = 0
                 current_curvature_cmd = np.zeros(2, dtype=np.float64)
-                robot_rest_positions = apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
+                current_insertion_cmd = 0.0
+                robot_rest_positions = apply_robot_pcc_shape(
+                    robot_dofs,
+                    curvature_command=current_curvature_cmd,
+                    insertion_offset=current_insertion_cmd,
+                )
                 # reset 后推进一个小步以刷新位置缓存
                 Sofa.Simulation.animate(root, 0.0001)
                 tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
@@ -471,29 +499,51 @@ def main():
                     baseline_force_level = (0.0, 0.0, 0.0)
             else:
                 # 执行一步控制：cable_disp 为曲率增量，累积后限幅
-                raw_cable_disp = np.asarray(cmd.get("cable_disp", [0.0, 0.0]), dtype=np.float64).reshape(-1)
+                raw_cable_disp = np.asarray(cmd.get("cable_disp", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(-1)
                 if raw_cable_disp.size == 0:
-                    raw_cable_disp = np.zeros(2, dtype=np.float64)
-                elif raw_cable_disp.size == 1:
-                    raw_cable_disp = np.array([raw_cable_disp[0], 0.0], dtype=np.float64)
+                    raw_cable_disp = np.zeros(3, dtype=np.float64)
+                elif raw_cable_disp.size < 3:
+                    raw_cable_disp = np.pad(raw_cable_disp, (0, 3 - raw_cable_disp.size))
                 else:
-                    raw_cable_disp = raw_cable_disp[:2]
+                    raw_cable_disp = raw_cable_disp[:3]
                 curvature_delta = np.clip(
-                    raw_cable_disp * CURVATURE_DELTA_SCALE,
+                    raw_cable_disp[:2] * CURVATURE_DELTA_SCALE,
                     -CURVATURE_DELTA_LIMIT,
                     CURVATURE_DELTA_LIMIT,
+                )
+                insertion_delta = float(
+                    np.clip(
+                        raw_cable_disp[2] * INSERTION_DELTA_SCALE,
+                        -INSERTION_DELTA_LIMIT,
+                        INSERTION_DELTA_LIMIT,
+                    )
                 )
                 current_curvature_cmd = np.clip(
                     current_curvature_cmd + curvature_delta,
                     -PCC_MAX_CURVATURE,
                     PCC_MAX_CURVATURE,
                 )
+                current_insertion_cmd = float(
+                    np.clip(
+                        current_insertion_cmd + insertion_delta,
+                        -INSERTION_LIMIT,
+                        INSERTION_LIMIT,
+                    )
+                )
                 current_curvature_cmd = np.asarray(current_curvature_cmd, dtype=np.float64)
-                apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
+                apply_robot_pcc_shape(
+                    robot_dofs,
+                    curvature_command=current_curvature_cmd,
+                    insertion_offset=current_insertion_cmd,
+                )
                 curvature_magnitude = float(np.linalg.norm(current_curvature_cmd))
                 if curvature_magnitude > PCC_MAX_CURVATURE:
                     current_curvature_cmd *= PCC_MAX_CURVATURE / max(curvature_magnitude, 1e-8)
-                    apply_robot_pcc_shape(robot_dofs, curvature_command=current_curvature_cmd)
+                    apply_robot_pcc_shape(
+                        robot_dofs,
+                        curvature_command=current_curvature_cmd,
+                        insertion_offset=current_insertion_cmd,
+                    )
 
                 # 多子步物理积分，使组织形变更充分
                 dt = float(root.dt.value)
@@ -558,6 +608,23 @@ def main():
                 contact_force_mean = 0.0
                 contact_force_peak = 0.0
                 contact_force_total = 0.0
+
+            if step_count % export_interval == 0:
+                try:
+                    with open(metrics_file, "a", encoding="utf-8") as f:
+                        f.write(
+                            f"{step_count},"
+                            f"{float(tip_position[0]):.8f},"
+                            f"{float(tip_position[1]):.8f},"
+                            f"{float(tip_position[2]):.8f},"
+                            f"{float(lesion_metrics['lesion_distance']):.8f},"
+                            f"{float(lesion_metrics['contact_distance']):.8f},"
+                            f"{contact_force_mean:.8f},"
+                            f"{contact_force_peak:.8f},"
+                            f"{contact_force_total:.8f}\n"
+                        )
+                except Exception as e:
+                    print(f"Frame Metrics Export Error: {e}")
 
             reply = {
                 # step: SOFA 物理步计数

@@ -29,8 +29,8 @@
 
 每个 RL step 的数据流如下：
 
-1. PPO 输出归一化动作 `action in [-1, 1]^2`
-2. `SoftSofaEnv.step()` 将动作映射为二维曲率增量 `cable_disp=[ky_delta,kz_delta]`
+1. PPO 输出归一化动作 `action in [-1, 1]^3`
+2. `SoftSofaEnv.step()` 将动作映射为曲率/插入增量 `cable_disp=[ky_delta,kz_delta,insertion_delta]`
 3. `SofaCableClient` 通过 ZMQ 发送 `{"type":"step","cable_disp":...}`
 4. SOFA 执行物理步进并计算状态
 5. SOFA 返回观测字典（含接触力统计、组织应变等）
@@ -53,8 +53,8 @@
 
 - Robot (`SoftBody`):
   - 分段常曲率（PCC）中心线 + `MechanicalObject(Vec3d)`
-  - 每步按二维累积曲率增量更新形状（固定基端）
-  - `ky` 控制 X-Y 平面弯曲，`kz` 控制 X-Z 平面弯曲，使末端可在病灶周围画圆
+  - 每步按累积曲率/插入增量更新形状（固定基端）
+  - `ky` 控制 X-Y 平面弯曲，`kz` 控制 X-Z 平面弯曲，`insertion` 控制沿 +X 插入/回撤
   - 曲率限制 `PCC_MAX_CURVATURE = 0.45`，每步曲率增量默认 `0.03`，避免末端甩出病灶工作区
   - `PointCollisionModel` + `LineCollisionModel`
   - 基座 `PCC_BASE_OFFSET = (-1.10, -0.08, 0)`，初始 tip 位于 `(0.10, -0.08, 0)`，中心线位于组织上方约 `0.02 m`
@@ -85,6 +85,7 @@ SOFA 每步回传：
 
 - `sofa/vtk_output/robot/frame_XXXX.vtk`
 - `sofa/vtk_output/tissue/frame_XXXX.vtk`
+- `sofa/vtk_output/frame_metrics.csv`（每帧接触力、接触距离、末端位置）
 
 导出间隔通过环境变量控制：
 
@@ -98,8 +99,8 @@ SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 
 ### 4.1 Action Space
 
-- `Box(low=-1, high=1, shape=(2,))`
-- 实际控制量：`cable_disp = action * action_scale`（二维曲率增量 `[ky_delta,kz_delta]`，SOFA 侧逐步累积）
+- `Box(low=-1, high=1, shape=(3,))`
+- 实际控制量：`cable_disp = action * action_scale`（`[ky_delta,kz_delta,insertion_delta]`，SOFA 侧逐步累积）
 
 ### 4.2 Observation Space
 
@@ -117,7 +118,7 @@ SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 
 ### 4.3 Reward Design
 
-任务目标：末端围绕病灶中心在 `Y-Z` 平面追踪一圈圆形轨迹。
+任务目标：末端围绕病灶中心在 `X-Z` 平面追踪一圈圆形轨迹。
 
 - 圆心：`lesion_center`
 - 半径：`circle_radius = 0.06 m`
@@ -151,6 +152,7 @@ scripts/train_task.sh start
 scripts/train_task.sh status
 scripts/train_task.sh logs sofa
 scripts/train_task.sh logs train
+scripts/train_task.sh stop   # 训练完成后停止 SOFA/RL tmux 会话
 ```
 
 默认解释器策略：
@@ -176,6 +178,8 @@ scripts/train_task.sh restart
 ```bash
 MOTION_SCALE=3 FRAME_STRIDE=1 scripts/make_demo_gif.sh logs/sofa_robot_tissue.gif
 ```
+
+若存在 `sofa/vtk_output/frame_metrics.csv`，GIF 会读取每帧 `contact_force_peak`，用机器人颜色和色条显示接触力大小。
 
 可选：
 

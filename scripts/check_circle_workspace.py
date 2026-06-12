@@ -13,14 +13,17 @@ PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 0.45
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
 LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
+INSERTION_LIMIT = 0.08
 
 
 def generate_tip(curvature_command):
-    curvature = np.asarray(curvature_command, dtype=np.float64).reshape(2)
+    command = np.asarray(curvature_command, dtype=np.float64).reshape(3)
+    curvature = command[:2]
+    insertion_offset = float(np.clip(command[2], -INSERTION_LIMIT, INSERTION_LIMIT))
     curvature = np.clip(curvature, -PCC_MAX_CURVATURE, PCC_MAX_CURVATURE)
     theta_y = 0.0
     theta_z = 0.0
-    current = PCC_BASE_OFFSET.copy()
+    current = PCC_BASE_OFFSET + np.array([insertion_offset, 0.0, 0.0], dtype=np.float64)
 
     for seg_len, seg_weight in zip(PCC_SEGMENT_LENGTHS, PCC_SEGMENT_WEIGHTS):
         seg_curvature = curvature * seg_weight
@@ -36,7 +39,7 @@ def generate_tip(curvature_command):
 
 def circle_target(radius, phase):
     return LESION_CENTER_REF + np.array(
-        [0.0, radius * math.cos(phase), radius * math.sin(phase)],
+        [radius * math.cos(phase), 0.0, radius * math.sin(phase)],
         dtype=np.float64,
     )
 
@@ -46,16 +49,19 @@ def main():
     parser.add_argument("--radius", type=float, default=0.06)
     parser.add_argument("--samples", type=int, default=49)
     parser.add_argument("--grid", type=int, default=91)
+    parser.add_argument("--insertion-grid", type=int, default=41)
     parser.add_argument("--tolerance", type=float, default=0.025)
     args = parser.parse_args()
 
     curvature_values = np.linspace(-PCC_MAX_CURVATURE, PCC_MAX_CURVATURE, args.grid)
+    insertion_values = np.linspace(-INSERTION_LIMIT, INSERTION_LIMIT, args.insertion_grid)
     tips = []
     commands = []
     for ky in curvature_values:
         for kz in curvature_values:
-            commands.append((ky, kz))
-            tips.append(generate_tip((ky, kz)))
+            for insertion_offset in insertion_values:
+                commands.append((ky, kz, insertion_offset))
+                tips.append(generate_tip((ky, kz, insertion_offset)))
     tips = np.asarray(tips)
     commands = np.asarray(commands)
 
@@ -73,14 +79,19 @@ def main():
     print(f"lesion_center={LESION_CENTER_REF.tolist()}")
     print(f"circle_radius={args.radius:.4f}")
     print(f"pcc_curvature_limit=+/-{PCC_MAX_CURVATURE:.4f}")
-    print(f"samples={args.samples} grid={args.grid} tolerance={args.tolerance:.4f}")
+    print(f"insertion_limit=+/-{INSERTION_LIMIT:.4f}")
+    print(
+        f"samples={args.samples} grid={args.grid} "
+        f"insertion_grid={args.insertion_grid} tolerance={args.tolerance:.4f}"
+    )
     print(f"max_error={errors.max():.6f}")
     print(f"mean_error={errors.mean():.6f}")
     print(f"min_error={errors.min():.6f}")
     print(
         "best_curvature_range="
         f"ky[{best_commands[:, 0].min():.4f},{best_commands[:, 0].max():.4f}] "
-        f"kz[{best_commands[:, 1].min():.4f},{best_commands[:, 1].max():.4f}]"
+        f"kz[{best_commands[:, 1].min():.4f},{best_commands[:, 1].max():.4f}] "
+        f"insertion[{best_commands[:, 2].min():.4f},{best_commands[:, 2].max():.4f}]"
     )
     if errors.max() <= args.tolerance:
         print("PASS: every sampled circle target is inside the reachable workspace tolerance.")

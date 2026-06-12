@@ -21,8 +21,8 @@ class SoftSofaEnv(gym.Env):
         self.sofa = SofaCableClient()
         self.max_episode_steps = int(max_episode_steps)
         self.t = 0
-        # 归一化动作到二维曲率增量的缩放系数：
-        # SOFA 每步累积 cable_disp = [ky_delta, kz_delta] * action_scale。
+        # 归一化动作到曲率/插入增量的缩放系数：
+        # SOFA 每步累积 cable_disp = [ky_delta, kz_delta, insertion_delta] * action_scale。
         self.action_scale = 1.0
         # 安全阈值参数（用于 done 判定，略放宽以允许更大动作）
         self.max_von_mises = 3200.0
@@ -34,7 +34,7 @@ class SoftSofaEnv(gym.Env):
         # - max_contact_force: 成功接触的上限（避免过压）
         self.max_contact_force = 1.4
         self.min_contact_force = 0.02
-        # 绕病灶画圆任务参数：圆在 Y-Z 平面内，圆心为病灶中心。
+        # 绕病灶画圆任务参数：圆在 X-Z 平面内，圆心为病灶中心。
         self.circle_radius = 0.06
         self.circle_period_steps = 240
         self.circle_target_tolerance = 0.025
@@ -45,8 +45,8 @@ class SoftSofaEnv(gym.Env):
         self.time_penalty = 0.002
 
         # 1. 定义动作空间 (Action Space)
-        # 标准化二维动作：[ky_delta, kz_delta]，发送前再做尺度映射
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        # 标准化三维动作：[ky_delta, kz_delta, insertion_delta]，发送前再做尺度映射
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
         # 2. 定义观测空间 (Observation Space)
         # 每个键都需与 _build_obs 完全对应。
@@ -106,12 +106,12 @@ class SoftSofaEnv(gym.Env):
     def step(self, action):
         self.t += 1
 
-        # SB3 输出一般是 ndarray，这里统一为二维向量并裁剪到 [-1, 1]
+        # SB3 输出一般是 ndarray，这里统一为三维向量并裁剪到 [-1, 1]
         normalized_action = np.asarray(action, dtype=np.float32).reshape(-1)
-        if normalized_action.size < 2:
-            normalized_action = np.pad(normalized_action, (0, 2 - normalized_action.size))
-        normalized_action = np.clip(normalized_action[:2], -1.0, 1.0)
-        # 动作映射到 SOFA 二维曲率增量（累积弯曲）
+        if normalized_action.size < 3:
+            normalized_action = np.pad(normalized_action, (0, 3 - normalized_action.size))
+        normalized_action = np.clip(normalized_action[:3], -1.0, 1.0)
+        # 动作映射到 SOFA 曲率/插入增量（累积控制）
         cable_disp = normalized_action * self.action_scale
         sofa_obs = self.sofa.step(cable_disp=cable_disp)
         if not self._is_valid_sofa_obs(sofa_obs):
@@ -204,7 +204,7 @@ class SoftSofaEnv(gym.Env):
         progress_term = self.progress_gain * float(np.clip(progress, -0.08, 0.08))
         lesion_center = obs["lesion_center"]
         tip_pos = obs["tip_pos"]
-        radial_distance = float(np.linalg.norm(tip_pos[1:3] - lesion_center[1:3]))
+        radial_distance = float(np.linalg.norm(tip_pos[[0, 2]] - lesion_center[[0, 2]]))
         radial_error = abs(radial_distance - self.circle_radius)
         radial_penalty = self.radial_gain * radial_error
         contact_force_peak = float(obs["contact_force_peak"][0])
@@ -249,8 +249,8 @@ class SoftSofaEnv(gym.Env):
 
     def _circle_target(self, lesion_center, phase):
         target = np.array(lesion_center, dtype=np.float32)
-        target[0] = lesion_center[0]
-        target[1] = lesion_center[1] + self.circle_radius * np.cos(phase)
+        target[0] = lesion_center[0] + self.circle_radius * np.cos(phase)
+        target[1] = lesion_center[1]
         target[2] = lesion_center[2] + self.circle_radius * np.sin(phase)
         return target
 

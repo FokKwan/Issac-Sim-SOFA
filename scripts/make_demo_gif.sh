@@ -12,6 +12,7 @@ FRAME_STRIDE="${FRAME_STRIDE:-1}"
 FPS="${FPS:-12}"
 POINT_SIZE="${POINT_SIZE:-12}"
 MOTION_SCALE="${MOTION_SCALE:-1.0}"
+METRICS_CSV="${METRICS_CSV:-sofa/vtk_output/frame_metrics.csv}"
 ELEVATION="${ELEVATION:-20}"
 AZIMUTH="${AZIMUTH:-40}"
 VENV_PATH="${VENV_PATH:-.venv}"
@@ -39,6 +40,7 @@ Environment overrides:
   FPS          Default: 12
   POINT_SIZE   Default: 12
   MOTION_SCALE Default: 1.0 (set >1.0 to amplify deformation visually)
+  METRICS_CSV  Default: sofa/vtk_output/frame_metrics.csv
   ELEVATION    Default: 20
   AZIMUTH      Default: 40
   VENV_PATH    Default: .venv
@@ -90,17 +92,19 @@ ensure_package meshio meshio
 ensure_package matplotlib matplotlib
 ensure_package PIL pillow
 
-export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE ELEVATION AZIMUTH
+export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE METRICS_CSV ELEVATION AZIMUTH
 
 "$PYTHON_BIN" - <<'PY'
 import glob
 import os
 import re
+import csv
 
 import meshio
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib import colors
 
 robot_glob = os.environ["ROBOT_GLOB"]
 tissue_glob = os.environ["TISSUE_GLOB"]
@@ -109,6 +113,7 @@ frame_stride = int(os.environ["FRAME_STRIDE"])
 fps = int(os.environ["FPS"])
 point_size = float(os.environ["POINT_SIZE"])
 motion_scale = float(os.environ["MOTION_SCALE"])
+metrics_csv = os.environ["METRICS_CSV"]
 elevation = float(os.environ["ELEVATION"])
 azimuth = float(os.environ["AZIMUTH"])
 
@@ -142,6 +147,25 @@ def dominant_point_count(point_clouds):
     return max(counts, key=counts.get)
 
 
+def load_frame_metrics(path):
+    if not path or not os.path.exists(path):
+        return {}
+    metrics = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                step = int(row["step"])
+                metrics[step] = {
+                    "contact_force_peak": float(row.get("contact_force_peak", 0.0)),
+                    "contact_force_mean": float(row.get("contact_force_mean", 0.0)),
+                    "contact_force_total": float(row.get("contact_force_total", 0.0)),
+                    "contact_distance": float(row.get("contact_distance", 1.0)),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+    return metrics
+
+
 robot_files = sorted(glob.glob(robot_glob))
 if not robot_files:
     raise SystemExit(f"[ERROR] No robot VTK frames found with pattern: {robot_glob}")
@@ -149,6 +173,7 @@ tissue_files = sorted(glob.glob(tissue_glob))
 
 robot_by_id = index_by_frame_id(robot_files)
 tissue_by_id = index_by_frame_id(tissue_files)
+metrics_by_id = load_frame_metrics(metrics_csv)
 common_ids = sorted(set(robot_by_id) & set(tissue_by_id)) if tissue_by_id else sorted(robot_by_id)
 if not common_ids:
     raise SystemExit("[ERROR] No robot/tissue frame pairs with matching frame IDs.")
@@ -159,6 +184,7 @@ if len(selected_ids) < 2 and len(common_ids) > 1:
 
 robot_point_clouds = []
 tissue_point_clouds = []
+frame_contact_values = []
 mins = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
 maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
 
@@ -168,6 +194,9 @@ for step in selected_ids:
     if robot_points.size == 0:
         continue
     robot_point_clouds.append((robot_path, robot_points))
+    frame_contact_values.append(
+        metrics_by_id.get(step, {}).get("contact_force_peak", 0.0)
+    )
     mins = np.minimum(mins, robot_points.min(axis=0))
     maxs = np.maximum(maxs, robot_points.max(axis=0))
 
@@ -190,8 +219,13 @@ dominant_tissue_count = dominant_point_count(
 )
 filtered_robot = []
 filtered_tissue = []
+filtered_contact_values = []
 skipped_topology = 0
-for (robot_path, robot_points), tissue_item in zip(robot_point_clouds, tissue_point_clouds or [None] * len(robot_point_clouds)):
+for (robot_path, robot_points), tissue_item, contact_value in zip(
+    robot_point_clouds,
+    tissue_point_clouds or [None] * len(robot_point_clouds),
+    frame_contact_values,
+):
     if dominant_robot_count is not None and robot_points.shape[0] != dominant_robot_count:
         skipped_topology += 1
         continue
@@ -201,6 +235,7 @@ for (robot_path, robot_points), tissue_item in zip(robot_point_clouds, tissue_po
         continue
     filtered_robot.append((robot_path, robot_points))
     filtered_tissue.append((tissue_path, tissue_points))
+    filtered_contact_values.append(float(contact_value))
 
 if skipped_topology:
     print(
@@ -209,6 +244,7 @@ if skipped_topology:
     )
 robot_point_clouds = filtered_robot
 tissue_point_clouds = filtered_tissue
+frame_contact_values = filtered_contact_values
 if len(robot_point_clouds) < 2:
     raise SystemExit(
         "[ERROR] After topology filtering, fewer than 2 frames remain. "
@@ -230,17 +266,28 @@ ax.set_zlim(mins[2], maxs[2])
 ax.set_box_aspect((maxs - mins).tolist())
 
 first_robot_points = robot_point_clouds[0][1]
-robot_colors = np.linspace(0.0, 1.0, first_robot_points.shape[0])
+contact_max = max(frame_contact_values) if frame_contact_values else 0.0
+use_contact_colors = bool(metrics_by_id) and contact_max > 0.0
+contact_norm = colors.Normalize(vmin=0.0, vmax=max(contact_max, 1e-8))
+robot_colors = (
+    np.full(first_robot_points.shape[0], frame_contact_values[0])
+    if use_contact_colors
+    else np.linspace(0.0, 1.0, first_robot_points.shape[0])
+)
 robot_scatter = ax.scatter(
     first_robot_points[:, 0],
     first_robot_points[:, 1],
     first_robot_points[:, 2],
     c=robot_colors,
-    cmap="viridis",
+    cmap="inferno" if use_contact_colors else "viridis",
+    norm=contact_norm if use_contact_colors else None,
     s=point_size,
     alpha=0.85,
     label="Robot",
 )
+if use_contact_colors:
+    colorbar = fig.colorbar(robot_scatter, ax=ax, shrink=0.65, pad=0.08)
+    colorbar.set_label("Contact force peak")
 tissue_scatter = None
 first_tissue_points = None
 if tissue_point_clouds:
@@ -278,6 +325,10 @@ def scaled_points(points, rest_by_count):
 def update(frame_idx):
     _path, robot_points = robot_point_clouds[frame_idx]
     render_robot_points = scaled_points(robot_points, robot_rest_by_count)
+    if use_contact_colors:
+        robot_scatter.set_array(
+            np.full(render_robot_points.shape[0], frame_contact_values[frame_idx])
+        )
     robot_scatter._offsets3d = (
         render_robot_points[:, 0],
         render_robot_points[:, 1],
@@ -295,8 +346,12 @@ def update(frame_idx):
                 render_tissue_points[:, 2],
             )
             artists.append(tissue_scatter)
+    contact_text = ""
+    if use_contact_colors:
+        contact_text = f" | contact_peak={frame_contact_values[frame_idx]:.4f}"
     ax.set_title(
-        f"SOFA deformation demo ({frame_idx + 1}/{len(robot_point_clouds)}) | motion_scale={motion_scale:.2f}"
+        f"SOFA deformation demo ({frame_idx + 1}/{len(robot_point_clouds)}) "
+        f"| motion_scale={motion_scale:.2f}{contact_text}"
     )
     return tuple(artists)
 
@@ -320,6 +375,14 @@ print(
     f"[INFO] Robot frames: {len(robot_files)}; Tissue frames: {len(tissue_files)}; "
     f"paired IDs: {len(common_ids)} -> rendered {len(robot_point_clouds)}; stride={frame_stride}"
 )
+if use_contact_colors:
+    print(
+        "[INFO] Contact force peak stats: "
+        f"min={min(frame_contact_values):.6f}, max={max(frame_contact_values):.6f}, "
+        f"mean={float(np.mean(frame_contact_values)):.6f}"
+    )
+elif metrics_by_id:
+    print("[INFO] Metrics CSV found, but all contact_force_peak values are zero.")
 print(
     "[INFO] Tip displacement stats (raw meters): "
     f"min={min(tip_displacements):.6f}, max={max(tip_displacements):.6f}, "
