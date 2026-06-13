@@ -122,10 +122,10 @@ SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 任务目标：末端围绕病灶中心在 `X-Z` 平面追踪一圈圆形轨迹。
 
 - 圆心：`lesion_center`
-- 半径：`circle_radius = 0.05 m`
+- 半径：`circle_radius = 0.06 m`
 - 周期：`circle_period_steps = 240`
-- 工作空间检查（6-DOF，`grid=25`）：`python scripts/check_circle_workspace.py --radius 0.05 --tolerance 0.01`
-- 可达性（当前布局）：`r=0.05 m` 时 72 相位采样 `max_error ≈ 3.5 mm`；`r ≤ 0.06 m` 仍可满足全点 `≤ 1 cm`
+- 工作空间检查（6-DOF）：`python scripts/check_circle_workspace.py --radius 0.06 --tolerance 0.01`
+- 可达性（当前布局）：`r=0.06 m` 时 72 相位采样 `max_error ≈ 6.2 mm`（`grid=17`），全点 `≤ 1 cm`
 
 `reward = -tracking - radial + progress - safety - over_contact + lap_bonus`
 
@@ -183,7 +183,7 @@ MOTION_SCALE=3 FRAME_STRIDE=1 scripts/make_demo_gif.sh logs/sofa_robot_tissue.gi
 
 GIF 图例（轨迹叠加均使用**物理坐标**，`MOTION_SCALE` 仅放大组织形变）：
 
-- 蓝色虚线圆：完整期望圆轨迹（半径 `TARGET_RADIUS=0.05`，圆心优先读 `frame_metrics.csv`）
+- 蓝色虚线圆：完整期望圆轨迹（半径 `TARGET_RADIUS=0.06`，圆心优先读 `frame_metrics.csv`）
 - 绿色星标路径：RL 每步 `circle_target`（相位按 `CIRCLE_PERIOD_STEPS=240` 计算）
 - 橙色实线/圆点：连续体末端实际轨迹（VTK `points[-1]`）
 - 粉色点云：组织；机器人点云颜色表示接触力（若存在 metrics CSV）
