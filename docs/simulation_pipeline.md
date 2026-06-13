@@ -179,6 +179,14 @@ scripts/train_task.sh restart
 MOTION_SCALE=3 FRAME_STRIDE=1 scripts/make_demo_gif.sh logs/sofa_robot_tissue.gif
 ```
 
+GIF 图例：
+
+- 蓝色虚线：期望圆轨迹（`TARGET_RADIUS=0.05`，圆心 `LESION_CENTER=0.08,-0.14,0.0`）
+- 橙色实线/圆点：连续体末端实际轨迹（由 VTK 每帧 `points[-1]` 累积）
+- 粉色点云：组织；机器人点云颜色表示接触力（若存在 metrics CSV）
+
+同时会生成 `logs/sofa_robot_tissue_trajectories.csv`，包含期望圆轨迹采样点与各帧末端坐标。
+
 若存在 `sofa/vtk_output/frame_metrics.csv`，GIF 会读取每帧 `contact_force_peak`，用机器人颜色和色条显示接触力大小。
 
 可选：

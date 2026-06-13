@@ -512,10 +512,73 @@ for phase_name, phase in (
         f"({point[0]:.6f}, {point[1]:.6f}, {point[2]:.6f})"
     )
 print("[INFO] Actual tip trajectory from rendered VTK frames (raw meters):")
-for frame_idx, (robot_path, _) in enumerate(robot_point_clouds):
-    step = frame_id(robot_path)
-    tip = raw_tip_trajectory[frame_idx]
-    print(
-        f"  frame={step:04d} tip=({tip[0]:.6f}, {tip[1]:.6f}, {tip[2]:.6f})"
+trajectory_csv_path = os.path.splitext(output_gif)[0] + "_trajectories.csv"
+with open(trajectory_csv_path, "w", newline="", encoding="utf-8") as trajectory_file:
+    writer_csv = csv.writer(trajectory_file)
+    writer_csv.writerow(
+        ["kind", "frame", "phase", "x", "y", "z", "center_x", "center_y", "center_z", "radius"]
     )
+    writer_csv.writerow(
+        [
+            "target_circle_meta",
+            "",
+            "",
+            "",
+            "",
+            "",
+            f"{lesion_center[0]:.6f}",
+            f"{lesion_center[1]:.6f}",
+            f"{lesion_center[2]:.6f}",
+            f"{target_radius:.6f}",
+        ]
+    )
+    for phase_name, phase in (
+        ("0", 0.0),
+        ("pi/2", 0.5 * np.pi),
+        ("pi", np.pi),
+        ("3pi/2", 1.5 * np.pi),
+    ):
+        point = np.array(
+            [
+                lesion_center[0] + target_radius * np.cos(phase),
+                lesion_center[1],
+                lesion_center[2] + target_radius * np.sin(phase),
+            ],
+            dtype=np.float64,
+        )
+        writer_csv.writerow(
+            [
+                "target_circle_sample",
+                "",
+                phase_name,
+                f"{point[0]:.6f}",
+                f"{point[1]:.6f}",
+                f"{point[2]:.6f}",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+    for frame_idx, (robot_path, _) in enumerate(robot_point_clouds):
+        step = frame_id(robot_path)
+        tip = raw_tip_trajectory[frame_idx]
+        print(
+            f"  frame={step:04d} tip=({tip[0]:.6f}, {tip[1]:.6f}, {tip[2]:.6f})"
+        )
+        writer_csv.writerow(
+            [
+                "tip_actual",
+                f"{step:04d}",
+                "",
+                f"{tip[0]:.6f}",
+                f"{tip[1]:.6f}",
+                f"{tip[2]:.6f}",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+print(f"[OK] Saved trajectory CSV: {trajectory_csv_path}")
 PY
