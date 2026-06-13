@@ -711,7 +711,7 @@ def main():
     metrics_file = os.path.join("vtk_output", "frame_metrics.csv")
     with open(metrics_file, "w", encoding="utf-8") as f:
         f.write(
-            "step,tip_x,tip_y,tip_z,lesion_distance,contact_distance,"
+            "step,tip_x,tip_y,tip_z,lesion_center_x,lesion_center_y,lesion_center_z,lesion_distance,contact_distance,"
             "contact_force_mean,contact_force_peak,contact_force_total,"
             "lesion_contact_distance,lesion_contact_force_mean,"
             "lesion_contact_force_peak,lesion_contact_force_total,"
@@ -927,6 +927,9 @@ def main():
                             f"{float(tip_position[0]):.8f},"
                             f"{float(tip_position[1]):.8f},"
                             f"{float(tip_position[2]):.8f},"
+                            f"{float(lesion_metrics['lesion_center'][0]):.8f},"
+                            f"{float(lesion_metrics['lesion_center'][1]):.8f},"
+                            f"{float(lesion_metrics['lesion_center'][2]):.8f},"
                             f"{float(lesion_metrics['lesion_distance']):.8f},"
                             f"{float(lesion_metrics['contact_distance']):.8f},"
                             f"{contact_force_mean:.8f},"

@@ -179,10 +179,11 @@ scripts/train_task.sh restart
 MOTION_SCALE=3 FRAME_STRIDE=1 scripts/make_demo_gif.sh logs/sofa_robot_tissue.gif
 ```
 
-GIF 图例：
+GIF 图例（轨迹叠加均使用**物理坐标**，`MOTION_SCALE` 仅放大组织形变）：
 
-- 蓝色虚线：期望圆轨迹（`TARGET_RADIUS=0.05`，圆心 `LESION_CENTER=0.08,-0.14,0.0`）
-- 橙色实线/圆点：连续体末端实际轨迹（由 VTK 每帧 `points[-1]` 累积）
+- 蓝色虚线圆：完整期望圆轨迹（半径 `TARGET_RADIUS=0.05`，圆心优先读 `frame_metrics.csv`）
+- 绿色星标路径：RL 每步 `circle_target`（相位按 `CIRCLE_PERIOD_STEPS=240` 计算）
+- 橙色实线/圆点：连续体末端实际轨迹（VTK `points[-1]`）
 - 粉色点云：组织；机器人点云颜色表示接触力（若存在 metrics CSV）
 
 同时会生成 `logs/sofa_robot_tissue_trajectories.csv`，包含期望圆轨迹采样点与各帧末端坐标。

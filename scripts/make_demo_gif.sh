@@ -17,6 +17,7 @@ ELEVATION="${ELEVATION:-20}"
 AZIMUTH="${AZIMUTH:-40}"
 LESION_CENTER="${LESION_CENTER:-0.08,-0.14,0.0}"
 TARGET_RADIUS="${TARGET_RADIUS:-0.05}"
+CIRCLE_PERIOD_STEPS="${CIRCLE_PERIOD_STEPS:-240}"
 VENV_PATH="${VENV_PATH:-.venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -47,6 +48,7 @@ Environment overrides:
   AZIMUTH      Default: 40
   LESION_CENTER Default: 0.08,-0.14,0.0
   TARGET_RADIUS Default: 0.05
+  CIRCLE_PERIOD_STEPS Default: 240 (must match issac_sim/envs/sofa_env.py)
   VENV_PATH    Default: .venv
   PYTHON_BIN   Default: python3 (or .venv/bin/python when available)
 EOF
@@ -96,7 +98,7 @@ ensure_package meshio meshio
 ensure_package matplotlib matplotlib
 ensure_package PIL pillow
 
-export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE METRICS_CSV ELEVATION AZIMUTH LESION_CENTER TARGET_RADIUS
+export ROBOT_GLOB TISSUE_GLOB OUTPUT_GIF FRAME_STRIDE FPS POINT_SIZE MOTION_SCALE METRICS_CSV ELEVATION AZIMUTH LESION_CENTER TARGET_RADIUS CIRCLE_PERIOD_STEPS
 
 "$PYTHON_BIN" - <<'PY'
 import glob
@@ -121,6 +123,7 @@ metrics_csv = os.environ["METRICS_CSV"]
 elevation = float(os.environ["ELEVATION"])
 azimuth = float(os.environ["AZIMUTH"])
 target_radius = float(os.environ["TARGET_RADIUS"])
+circle_period_steps = int(os.environ["CIRCLE_PERIOD_STEPS"])
 
 
 def parse_vec3(value, default):
@@ -131,9 +134,6 @@ def parse_vec3(value, default):
     if len(parts) != 3:
         return np.asarray(default, dtype=np.float64)
     return np.asarray(parts, dtype=np.float64)
-
-
-lesion_center = parse_vec3(os.environ["LESION_CENTER"], [0.08, -0.14, 0.0])
 
 
 def frame_id(path):
@@ -174,6 +174,12 @@ def load_frame_metrics(path):
             try:
                 step = int(row["step"])
                 metrics[step] = {
+                    "tip_x": float(row.get("tip_x", 0.0)),
+                    "tip_y": float(row.get("tip_y", 0.0)),
+                    "tip_z": float(row.get("tip_z", 0.0)),
+                    "lesion_center_x": float(row.get("lesion_center_x", "nan")),
+                    "lesion_center_y": float(row.get("lesion_center_y", "nan")),
+                    "lesion_center_z": float(row.get("lesion_center_z", "nan")),
                     "contact_force_peak": float(row.get("contact_force_peak", 0.0)),
                     "contact_force_mean": float(row.get("contact_force_mean", 0.0)),
                     "contact_force_total": float(row.get("contact_force_total", 0.0)),
@@ -190,6 +196,34 @@ def load_frame_metrics(path):
     return metrics
 
 
+def resolve_lesion_center(metrics_by_id, fallback):
+    for step in sorted(metrics_by_id):
+        row = metrics_by_id[step]
+        center = np.array(
+            [
+                row.get("lesion_center_x", float("nan")),
+                row.get("lesion_center_y", float("nan")),
+                row.get("lesion_center_z", float("nan")),
+            ],
+            dtype=np.float64,
+        )
+        if np.all(np.isfinite(center)):
+            return center
+    return np.asarray(fallback, dtype=np.float64)
+
+
+def circle_target_at_step(step, center, radius, period_steps):
+    phase = 2.0 * np.pi * min(max(step, 0), period_steps) / float(period_steps)
+    return np.array(
+        [
+            center[0] + radius * np.cos(phase),
+            center[1],
+            center[2] + radius * np.sin(phase),
+        ],
+        dtype=np.float64,
+    )
+
+
 robot_files = sorted(glob.glob(robot_glob))
 if not robot_files:
     raise SystemExit(f"[ERROR] No robot VTK frames found with pattern: {robot_glob}")
@@ -198,6 +232,7 @@ tissue_files = sorted(glob.glob(tissue_glob))
 robot_by_id = index_by_frame_id(robot_files)
 tissue_by_id = index_by_frame_id(tissue_files)
 metrics_by_id = load_frame_metrics(metrics_csv)
+lesion_center = resolve_lesion_center(metrics_by_id, parse_vec3(os.environ["LESION_CENTER"], [0.08, -0.14, 0.0]))
 common_ids = sorted(set(robot_by_id) & set(tissue_by_id)) if tissue_by_id else sorted(robot_by_id)
 if not common_ids:
     raise SystemExit("[ERROR] No robot/tissue frame pairs with matching frame IDs.")
@@ -282,6 +317,7 @@ if skipped_topology:
 robot_point_clouds = filtered_robot
 tissue_point_clouds = filtered_tissue
 frame_contact_values = filtered_contact_values
+frame_steps = [frame_id(path) for path, _ in robot_point_clouds]
 if len(robot_point_clouds) < 2:
     raise SystemExit(
         "[ERROR] After topology filtering, fewer than 2 frames remain. "
@@ -364,13 +400,14 @@ ax.view_init(elev=elevation, azim=azimuth)
 if motion_scale <= 0:
     raise SystemExit("[ERROR] MOTION_SCALE must be > 0")
 
-robot_rest_by_count = {first_robot_points.shape[0]: first_robot_points.copy()}
+# 轨迹叠加始终使用物理坐标；MOTION_SCALE 仅放大组织形变，避免末端轨迹与期望圆错位。
+robot_rest_by_count = {}
 tissue_rest_by_count = {}
 if first_tissue_points is not None:
     tissue_rest_by_count[first_tissue_points.shape[0]] = first_tissue_points.copy()
 
 
-def scaled_points(points, rest_by_count):
+def scaled_tissue_points(points, rest_by_count):
     if motion_scale == 1.0:
         return points
     rest = rest_by_count.get(points.shape[0])
@@ -383,27 +420,49 @@ raw_tip_trajectory = np.array(
     [points[-1].copy() for _, points in robot_point_clouds],
     dtype=np.float64,
 )
-tip_trajectory = np.array(
-    [scaled_points(points, robot_rest_by_count)[-1].copy() for _, points in robot_point_clouds],
+expected_target_trajectory = np.array(
+    [
+        circle_target_at_step(step, lesion_center, target_radius, circle_period_steps)
+        for step in frame_steps
+    ],
     dtype=np.float64,
 )
 
 tip_path_line, = ax.plot(
-    [tip_trajectory[0, 0]],
-    [tip_trajectory[0, 1]],
-    [tip_trajectory[0, 2]],
+    [raw_tip_trajectory[0, 0]],
+    [raw_tip_trajectory[0, 1]],
+    [raw_tip_trajectory[0, 2]],
     color="#ff7f0e",
     linewidth=2.5,
     alpha=0.95,
-    label="Tip trajectory",
+    label="Tip trajectory (raw)",
 )
 tip_current_marker = ax.scatter(
-    [tip_trajectory[0, 0]],
-    [tip_trajectory[0, 1]],
-    [tip_trajectory[0, 2]],
+    [raw_tip_trajectory[0, 0]],
+    [raw_tip_trajectory[0, 1]],
+    [raw_tip_trajectory[0, 2]],
     c="#ff7f0e",
     marker="o",
     s=max(24.0, point_size * 2.0),
+    alpha=0.95,
+    depthshade=False,
+)
+expected_path_line, = ax.plot(
+    [expected_target_trajectory[0, 0]],
+    [expected_target_trajectory[0, 1]],
+    [expected_target_trajectory[0, 2]],
+    color="#2ca02c",
+    linewidth=2.0,
+    alpha=0.95,
+    label="Expected target path",
+)
+expected_current_marker = ax.scatter(
+    [expected_target_trajectory[0, 0]],
+    [expected_target_trajectory[0, 1]],
+    [expected_target_trajectory[0, 2]],
+    c="#2ca02c",
+    marker="*",
+    s=max(36.0, point_size * 3.0),
     alpha=0.95,
     depthshade=False,
 )
@@ -412,30 +471,46 @@ ax.legend(loc="upper right")
 
 def update(frame_idx):
     _path, robot_points = robot_point_clouds[frame_idx]
-    render_robot_points = scaled_points(robot_points, robot_rest_by_count)
     if use_contact_colors:
         robot_scatter.set_array(
-            np.full(render_robot_points.shape[0], frame_contact_values[frame_idx])
+            np.full(robot_points.shape[0], frame_contact_values[frame_idx])
         )
     robot_scatter._offsets3d = (
-        render_robot_points[:, 0],
-        render_robot_points[:, 1],
-        render_robot_points[:, 2],
+        robot_points[:, 0],
+        robot_points[:, 1],
+        robot_points[:, 2],
     )
-    artists = [robot_scatter, target_circle_line, lesion_center_marker, tip_path_line, tip_current_marker]
+    artists = [
+        robot_scatter,
+        target_circle_line,
+        lesion_center_marker,
+        tip_path_line,
+        tip_current_marker,
+        expected_path_line,
+        expected_current_marker,
+    ]
 
-    trail = tip_trajectory[: frame_idx + 1]
-    tip_path_line.set_data_3d(trail[:, 0], trail[:, 1], trail[:, 2])
+    tip_trail = raw_tip_trajectory[: frame_idx + 1]
+    tip_path_line.set_data_3d(tip_trail[:, 0], tip_trail[:, 1], tip_trail[:, 2])
     tip_current_marker._offsets3d = (
-        np.array([trail[-1, 0]]),
-        np.array([trail[-1, 1]]),
-        np.array([trail[-1, 2]]),
+        np.array([tip_trail[-1, 0]]),
+        np.array([tip_trail[-1, 1]]),
+        np.array([tip_trail[-1, 2]]),
+    )
+    expected_trail = expected_target_trajectory[: frame_idx + 1]
+    expected_path_line.set_data_3d(
+        expected_trail[:, 0], expected_trail[:, 1], expected_trail[:, 2]
+    )
+    expected_current_marker._offsets3d = (
+        np.array([expected_trail[-1, 0]]),
+        np.array([expected_trail[-1, 1]]),
+        np.array([expected_trail[-1, 2]]),
     )
 
     if tissue_scatter is not None and frame_idx < len(tissue_point_clouds):
         _, tissue_points = tissue_point_clouds[frame_idx]
         if tissue_points is not None:
-            render_tissue_points = scaled_points(tissue_points, tissue_rest_by_count)
+            render_tissue_points = scaled_tissue_points(tissue_points, tissue_rest_by_count)
             tissue_scatter._offsets3d = (
                 render_tissue_points[:, 0],
                 render_tissue_points[:, 1],
@@ -447,7 +522,7 @@ def update(frame_idx):
         contact_text = f" | lesion_contact_peak={frame_contact_values[frame_idx]:.4f}"
     ax.set_title(
         f"SOFA deformation demo ({frame_idx + 1}/{len(robot_point_clouds)}) "
-        f"| motion_scale={motion_scale:.2f}{contact_text}"
+        f"| tissue_motion_scale={motion_scale:.2f}{contact_text}"
     )
     return tuple(artists)
 
@@ -580,5 +655,23 @@ with open(trajectory_csv_path, "w", newline="", encoding="utf-8") as trajectory_
                 "",
             ]
         )
+        expected = expected_target_trajectory[frame_idx]
+        writer_csv.writerow(
+            [
+                "circle_target_expected",
+                f"{step:04d}",
+                "",
+                f"{expected[0]:.6f}",
+                f"{expected[1]:.6f}",
+                f"{expected[2]:.6f}",
+                f"{lesion_center[0]:.6f}",
+                f"{lesion_center[1]:.6f}",
+                f"{lesion_center[2]:.6f}",
+                f"{target_radius:.6f}",
+            ]
+        )
 print(f"[OK] Saved trajectory CSV: {trajectory_csv_path}")
+print(
+    "[INFO] Overlay uses raw robot/tip/circle coords; MOTION_SCALE only affects tissue deformation."
+)
 PY
