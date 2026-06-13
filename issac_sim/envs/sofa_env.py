@@ -23,7 +23,7 @@ class SoftSofaEnv(gym.Env):
         self.t = 0
         # 归一化动作到曲率/插入增量的缩放系数：
         # SOFA 每步累积 cable_disp =
-        # [ky_prox_delta, ky_dist_delta, kz_prox_delta, kz_dist_delta, insertion_delta] * action_scale。
+        # [ky_prox_delta, ky_dist_delta, kz_prox_delta, kz_dist_delta, insertion_delta, roll_delta] * action_scale。
         self.action_scale = 1.0
         # 安全阈值参数（用于 done 判定，略放宽以允许更大动作）
         self.max_von_mises = 3200.0
@@ -47,8 +47,8 @@ class SoftSofaEnv(gym.Env):
         self.time_penalty = 0.002
 
         # 1. 定义动作空间 (Action Space)
-        # 标准化五维动作：XY/XZ 平面各两个曲率段，加 tip 端有效伸出长度。
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
+        # 标准化六维动作：四段曲率、插入、绕 +X 自转角。
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
 
         # 2. 定义观测空间 (Observation Space)
         # 每个键都需与 _build_obs 完全对应。
@@ -119,11 +119,11 @@ class SoftSofaEnv(gym.Env):
     def step(self, action):
         self.t += 1
 
-        # SB3 输出一般是 ndarray，这里统一为五维向量并裁剪到 [-1, 1]
+        # SB3 输出一般是 ndarray，这里统一为六维向量并裁剪到 [-1, 1]
         normalized_action = np.asarray(action, dtype=np.float32).reshape(-1)
-        if normalized_action.size < 5:
-            normalized_action = np.pad(normalized_action, (0, 5 - normalized_action.size))
-        normalized_action = np.clip(normalized_action[:5], -1.0, 1.0)
+        if normalized_action.size < 6:
+            normalized_action = np.pad(normalized_action, (0, 6 - normalized_action.size))
+        normalized_action = np.clip(normalized_action[:6], -1.0, 1.0)
         # 动作映射到 SOFA 曲率/插入增量（累积控制）
         cable_disp = normalized_action * self.action_scale
         sofa_obs = self.sofa.step(cable_disp=cable_disp)

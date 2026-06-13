@@ -29,8 +29,8 @@
 
 每个 RL step 的数据流如下：
 
-1. PPO 输出归一化动作 `action in [-1, 1]^3`
-2. `SoftSofaEnv.step()` 将动作映射为曲率/插入增量 `cable_disp=[ky_delta,kz_delta,insertion_delta]`
+1. PPO 输出归一化动作 `action in [-1, 1]^6`
+2. `SoftSofaEnv.step()` 将动作映射为增量 `cable_disp=[ky_prox, ky_dist, kz_prox, kz_dist, insertion, roll_x]`
 3. `SofaCableClient` 通过 ZMQ 发送 `{"type":"step","cable_disp":...}`
 4. SOFA 执行物理步进并计算状态
 5. SOFA 返回观测字典（含接触力统计、组织应变等）
@@ -53,8 +53,9 @@
 
 - Robot (`SoftBody`):
   - 分段常曲率（PCC）中心线 + `MechanicalObject(Vec3d)`
-  - 每步按累积曲率/插入增量更新形状（固定基端）
-  - `ky` 控制 X-Y 平面弯曲，`kz` 控制 X-Z 平面弯曲，`insertion` 控制沿 +X 插入/回撤
+  - 每步按累积曲率/插入/绕 X 自转角增量更新形状（固定基端）
+  - `ky_prox/ky_dist` 控制 X-Y 平面 S 型弯曲，`kz_prox/kz_dist` 控制 X-Z 平面 S 型弯曲
+  - `insertion` 控制沿 +X 插入/回撤，`roll_x` 控制绕 +X 轴自转（弧度，基座固定）
   - 曲率限制 `PCC_MAX_CURVATURE = 0.45`，每步曲率增量默认 `0.03`，避免末端甩出病灶工作区
   - `PointCollisionModel` + `LineCollisionModel`
   - 基座 `PCC_BASE_OFFSET = (-1.10, -0.08, 0)`，初始 tip 位于 `(0.10, -0.08, 0)`，中心线位于组织上方约 `0.02 m`
@@ -99,8 +100,8 @@ SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 
 ### 4.1 Action Space
 
-- `Box(low=-1, high=1, shape=(3,))`
-- 实际控制量：`cable_disp = action * action_scale`（`[ky_delta,kz_delta,insertion_delta]`，SOFA 侧逐步累积）
+- `Box(low=-1, high=1, shape=(6,))`
+- 实际控制量：`cable_disp = action * action_scale`（`[ky_prox, ky_dist, kz_prox, kz_dist, insertion, roll_x]`，SOFA 侧逐步累积）
 
 ### 4.2 Observation Space
 

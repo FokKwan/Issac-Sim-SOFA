@@ -35,7 +35,9 @@ PCC_SEGMENT_WEIGHTS = [1.00, 0.95, 0.90, 0.85]
 PCC_POINTS_PER_SEGMENT = 8
 PCC_MAX_CURVATURE = 1.20  # 1/m，固定基端后需要更大曲率进入组织内部画小圆
 PCC_CURVATURE_DOF = 4  # [ky_prox, ky_dist, kz_prox, kz_dist]，每个平面两段曲率可形成 S 型
-PCC_ACTION_DOF = PCC_CURVATURE_DOF + 1
+PCC_INSERTION_INDEX = 4
+PCC_ROLL_INDEX = 5
+PCC_ACTION_DOF = PCC_CURVATURE_DOF + 2  # 插入 + 绕 X 轴自转角
 # 机器人基座初始偏移（左侧固定，主轴沿 +x 方向）
 # 初始 tip 在原基座附近 (0.10, -0.08)，负曲率时末端向组织/病灶方向弯曲。
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
@@ -53,6 +55,10 @@ CURVATURE_DELTA_LIMIT = 0.04
 INSERTION_DELTA_SCALE = 0.01
 INSERTION_DELTA_LIMIT = 0.015
 INSERTION_LIMIT = 0.08
+# 绕主轴 (+X) 自转角（弧度），用于在 Y-Z 平面内旋转已弯曲构型。
+ROLL_LIMIT = float(np.pi)
+ROLL_DELTA_SCALE = 0.08
+ROLL_DELTA_LIMIT = 0.10
 # tip 端限速：单个 RL step 内最大几何位移，避免曲率/插入命令造成末端突跳。
 TIP_MAX_STEP_DISPLACEMENT = 0.006
 # 每个 RL step 执行的物理子步数，提升组织响应幅度
@@ -145,6 +151,44 @@ def generate_segmented_constant_curvature_points(curvature_command, insertion_of
             current[2] += np.sin(theta_z) * ds
             points.append(current.copy())
     return np.asarray(points, dtype=np.float64)
+
+
+def rotate_points_about_x_axis(points, base_position, roll_angle):
+    """
+    绕通过基座的 X 轴旋转中心线（基座点保持不动）。
+
+    Args:
+        points: (N, 3) 中心线点集
+        base_position: 基座坐标
+        roll_angle: 绕 +X 转角（弧度）
+    """
+    if points.size == 0:
+        return points
+    rotated = np.asarray(points, dtype=np.float64).copy()
+    base = np.asarray(base_position, dtype=np.float64).reshape(3)
+    roll = float(roll_angle)
+    if abs(roll) < 1e-12:
+        return rotated
+    relative = rotated - base
+    cos_roll = np.cos(roll)
+    sin_roll = np.sin(roll)
+    y = relative[:, 1]
+    z = relative[:, 2]
+    relative[:, 1] = y * cos_roll - z * sin_roll
+    relative[:, 2] = y * sin_roll + z * cos_roll
+    rotated = base + relative
+    rotated[0] = base
+    return rotated
+
+
+def compose_robot_centerline(curvature_command, insertion_offset=0.0, roll_angle=0.0):
+    """生成带插入与绕 X 自转的中心线。"""
+    points = generate_segmented_constant_curvature_points(
+        curvature_command=curvature_command,
+        insertion_offset=insertion_offset,
+    )
+    roll = float(np.clip(roll_angle, -ROLL_LIMIT, ROLL_LIMIT))
+    return rotate_points_about_x_axis(points, PCC_BASE_OFFSET, roll)
 
 
 def compute_point_cloud_aabb_clearance(points, bbox_min, bbox_max):
@@ -560,7 +604,7 @@ def read_constraint_forces(constraint_solver):
     return np.asarray(raw_values, dtype=np.float64).reshape(-1)
 
 
-def apply_robot_pcc_shape(robot_dofs, curvature_command, insertion_offset=0.0):
+def apply_robot_pcc_shape(robot_dofs, curvature_command, insertion_offset=0.0, roll_angle=0.0):
     """
     按分段常曲率模型更新机器人中心线点位（固定基端）。
 
@@ -568,13 +612,15 @@ def apply_robot_pcc_shape(robot_dofs, curvature_command, insertion_offset=0.0):
         robot_dofs: SOFA MechanicalObject
         curvature_command: 目标曲率控制量
         insertion_offset: 固定基端下的有效伸出长度变化
+        roll_angle: 绕 +X 自转角（弧度）
 
     Returns:
         np.ndarray: 更新后的中心线点集
     """
-    points = generate_segmented_constant_curvature_points(
+    points = compose_robot_centerline(
         curvature_command=curvature_command,
         insertion_offset=insertion_offset,
+        roll_angle=roll_angle,
     )
     robot_dofs.position.value = points.tolist()
     return points
@@ -583,25 +629,35 @@ def apply_robot_pcc_shape(robot_dofs, curvature_command, insertion_offset=0.0):
 def limit_tip_step_motion(
     previous_curvature,
     previous_insertion,
+    previous_roll,
     target_curvature,
     target_insertion,
+    target_roll,
     current_tip_position,
 ):
     """
     限制单个控制 step 内的 tip 几何位移，避免速度突变。
     """
-    target_points = generate_segmented_constant_curvature_points(
+    target_points = compose_robot_centerline(
         curvature_command=target_curvature,
         insertion_offset=target_insertion,
+        roll_angle=target_roll,
     )
     target_tip_step = float(np.linalg.norm(target_points[-1] - current_tip_position))
     if target_tip_step <= TIP_MAX_STEP_DISPLACEMENT:
-        return target_curvature, target_insertion, target_tip_step, False
+        return (
+            normalize_s_curve_curvature_command(target_curvature),
+            float(np.clip(target_insertion, -INSERTION_LIMIT, INSERTION_LIMIT)),
+            float(np.clip(target_roll, -ROLL_LIMIT, ROLL_LIMIT)),
+            target_tip_step,
+            False,
+        )
 
     low = 0.0
     high = 1.0
     limited_curvature = np.asarray(previous_curvature, dtype=np.float64)
     limited_insertion = float(previous_insertion)
+    limited_roll = float(previous_roll)
     limited_tip_step = 0.0
     for _ in range(12):
         alpha = 0.5 * (low + high)
@@ -615,19 +671,28 @@ def limit_tip_step_motion(
                 INSERTION_LIMIT,
             )
         )
-        candidate_points = generate_segmented_constant_curvature_points(
+        candidate_roll = float(
+            np.clip(
+                previous_roll + alpha * (target_roll - previous_roll),
+                -ROLL_LIMIT,
+                ROLL_LIMIT,
+            )
+        )
+        candidate_points = compose_robot_centerline(
             curvature_command=candidate_curvature,
             insertion_offset=candidate_insertion,
+            roll_angle=candidate_roll,
         )
         candidate_tip_step = float(np.linalg.norm(candidate_points[-1] - current_tip_position))
         if candidate_tip_step <= TIP_MAX_STEP_DISPLACEMENT:
             low = alpha
             limited_curvature = candidate_curvature
             limited_insertion = candidate_insertion
+            limited_roll = candidate_roll
             limited_tip_step = candidate_tip_step
         else:
             high = alpha
-    return limited_curvature, limited_insertion, limited_tip_step, True
+    return limited_curvature, limited_insertion, limited_roll, limited_tip_step, True
 
 
 def main():
@@ -657,11 +722,13 @@ def main():
     tissue_dofs = root.TargetTissue.dofs
     current_curvature_cmd = np.zeros(PCC_CURVATURE_DOF, dtype=np.float64)
     current_insertion_cmd = 0.0
+    current_roll_cmd = 0.0
 
     robot_rest_positions = apply_robot_pcc_shape(
         robot_dofs,
         curvature_command=0.0,
         insertion_offset=0.0,
+        roll_angle=0.0,
     )
     tissue_rest_positions = np.array(tissue_dofs.position.value, copy=True)
     rest_tip_position = np.array(robot_rest_positions[-1], copy=True)
@@ -744,10 +811,12 @@ def main():
                 tip_velocity_limited = False
                 current_curvature_cmd = np.zeros(PCC_CURVATURE_DOF, dtype=np.float64)
                 current_insertion_cmd = 0.0
+                current_roll_cmd = 0.0
                 robot_rest_positions = apply_robot_pcc_shape(
                     robot_dofs,
                     curvature_command=current_curvature_cmd,
                     insertion_offset=current_insertion_cmd,
+                    roll_angle=current_roll_cmd,
                 )
                 # reset 后推进一个小步以刷新位置缓存
                 Sofa.Simulation.animate(root, 0.0001)
@@ -777,7 +846,7 @@ def main():
                     baseline_force_level = (0.0, 0.0, 0.0)
             else:
                 # 执行一步控制：cable_disp 为曲率/插入增量，累积后限幅。
-                # 新格式：[ky_prox_delta, ky_dist_delta, kz_prox_delta, kz_dist_delta, insertion_delta]
+                # 新格式：[ky_prox, ky_dist, kz_prox, kz_dist, insertion_delta, roll_delta]
                 raw_cable_disp = np.asarray(
                     cmd.get("cable_disp", np.zeros(PCC_ACTION_DOF, dtype=np.float64)),
                     dtype=np.float64,
@@ -795,9 +864,16 @@ def main():
                 )
                 insertion_delta = float(
                     np.clip(
-                        raw_cable_disp[PCC_CURVATURE_DOF] * INSERTION_DELTA_SCALE,
+                        raw_cable_disp[PCC_INSERTION_INDEX] * INSERTION_DELTA_SCALE,
                         -INSERTION_DELTA_LIMIT,
                         INSERTION_DELTA_LIMIT,
+                    )
+                )
+                roll_delta = float(
+                    np.clip(
+                        raw_cable_disp[PCC_ROLL_INDEX] * ROLL_DELTA_SCALE,
+                        -ROLL_DELTA_LIMIT,
+                        ROLL_DELTA_LIMIT,
                     )
                 )
                 target_curvature_cmd = normalize_s_curve_curvature_command(
@@ -810,23 +886,34 @@ def main():
                         INSERTION_LIMIT,
                     )
                 )
+                target_roll_cmd = float(
+                    np.clip(
+                        current_roll_cmd + roll_delta,
+                        -ROLL_LIMIT,
+                        ROLL_LIMIT,
+                    )
+                )
                 current_tip_position = np.array(robot_dofs.position.value, dtype=np.float64)[-1]
                 (
                     current_curvature_cmd,
                     current_insertion_cmd,
+                    current_roll_cmd,
                     tip_step_displacement,
                     tip_velocity_limited,
                 ) = limit_tip_step_motion(
                     previous_curvature=current_curvature_cmd,
                     previous_insertion=current_insertion_cmd,
+                    previous_roll=current_roll_cmd,
                     target_curvature=target_curvature_cmd,
                     target_insertion=target_insertion_cmd,
+                    target_roll=target_roll_cmd,
                     current_tip_position=current_tip_position,
                 )
                 apply_robot_pcc_shape(
                     robot_dofs,
                     curvature_command=current_curvature_cmd,
                     insertion_offset=current_insertion_cmd,
+                    roll_angle=current_roll_cmd,
                 )
 
                 # 多子步物理积分，使组织形变更充分
@@ -956,6 +1043,7 @@ def main():
                 "tip_step_displacement": tip_step_displacement,
                 "tip_step_speed": tip_step_speed,
                 "tip_velocity_limited": tip_velocity_limited,
+                "roll_angle": float(current_roll_cmd),
                 "von_mises": von_mises,
                 "avg_strain": avg_strain,
                 "lesion_distance": lesion_metrics["lesion_distance"],
