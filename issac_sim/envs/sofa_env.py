@@ -38,11 +38,12 @@ class SoftSofaEnv(gym.Env):
         # 绕病灶画圆任务参数：圆在 X-Z 平面内，圆心为病灶中心。
         self.circle_radius = 0.05
         self.circle_period_steps = 240
-        self.circle_target_tolerance = 0.025
-        # 奖励整形参数
-        self.tracking_gain = 8.0
-        self.radial_gain = 2.0
-        self.progress_gain = 3.0
+        self.circle_target_tolerance = 0.010
+        # 奖励整形参数：加大轨迹追踪惩罚，使末端贴近期望圆轨迹
+        self.tracking_gain = 25.0
+        self.circle_error_squared_gain = 60.0
+        self.radial_gain = 12.0
+        self.progress_gain = 8.0
         self.time_penalty = 0.002
 
         # 1. 定义动作空间 (Action Space)
@@ -230,17 +231,20 @@ class SoftSofaEnv(gym.Env):
         }
 
     def _compute_reward(self, obs):
-        # 奖励设计：追踪病灶周围圆形目标点，同时惩罚偏离圆半径和危险形变。
+        # 奖励设计：强惩罚末端偏离期望圆轨迹，同时约束半径与安全指标。
         circle_error = float(obs["circle_error"][0])
-        task_term = -self.tracking_gain * circle_error
+        tracking_penalty = (
+            self.tracking_gain * circle_error
+            + self.circle_error_squared_gain * (circle_error ** 2)
+        )
         progress = self._prev_circle_error - circle_error
         self._last_progress = float(progress)
-        progress_term = self.progress_gain * float(np.clip(progress, -0.08, 0.08))
+        progress_term = self.progress_gain * float(np.clip(progress, -0.05, 0.05))
         lesion_center = obs["lesion_center"]
         tip_pos = obs["tip_pos"]
         radial_distance = float(np.linalg.norm(tip_pos[[0, 2]] - lesion_center[[0, 2]]))
         radial_error = abs(radial_distance - self.circle_radius)
-        radial_penalty = self.radial_gain * radial_error
+        radial_penalty = self.radial_gain * radial_error + 30.0 * (radial_error ** 2)
         contact_force_peak = max(
             float(obs["contact_force_peak"][0]),
             float(obs["lesion_contact_force_peak"][0]),
@@ -252,9 +256,9 @@ class SoftSofaEnv(gym.Env):
             + 0.14 * float(obs["lesion_strain"][0])
         )
         excessive_contact_penalty = 0.5 * max(contact_force_peak - self.max_contact_force, 0.0) ** 2
-        lap_bonus = 8.0 if self._is_success(obs) else 0.0
+        lap_bonus = 15.0 if self._is_success(obs) else 0.0
         return (
-            task_term
+            -tracking_penalty
             + progress_term
             - radial_penalty
             - safety_penalty

@@ -125,21 +125,21 @@ SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 - 周期：`circle_period_steps = 240`
 - 工作空间检查：`python scripts/check_circle_workspace.py --radius 0.05`
 
-`reward = tracking + progress - radial - safety - over_contact + lap_bonus`
+`reward = -tracking - radial + progress - safety - over_contact + lap_bonus`
 
-- tracking: 惩罚末端到当前圆周目标点的距离
-- progress: 奖励相对上一步减小 `circle_error`
-- radial: 惩罚末端偏离圆半径
+- tracking: `25 * circle_error + 60 * circle_error^2`，强惩罚末端偏离当前圆周目标点
+- progress: `8 * clip(circle_error 改善量, ±0.05)`，奖励逐步贴近目标
+- radial: `12 * |r-r0| + 30 * (r-r0)^2`，惩罚末端偏离期望圆半径
 - safety: 机器人/组织/病灶应变惩罚
 - over_contact: 过大接触力惩罚
-- lap_bonus: 完成一圈且仍贴近目标点时额外奖励
+- lap_bonus: 完成一圈且 `circle_error < 0.01 m` 时额外 +15
 
 ### 4.4 Termination
 
 - 安全超限（应变/应力/过大接触力）
 - 或达到成功条件：
   - `t >= circle_period_steps`
-  - `circle_error < circle_target_tolerance`
+  - `circle_error < circle_target_tolerance`（当前 `0.01 m`）
 
 ---
 
