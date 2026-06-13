@@ -62,7 +62,7 @@
 
 - Tissue (`TargetTissue`):
   - `RegularGridTopology` (10x6x5)，范围 `min=(-0.18, -0.22, -0.06)` 到 `max=(0.25, -0.10, 0.06)`
-  - 病灶中心 `LESION_CENTER_REF = (0.08, -0.14, 0)`（PCC 工作空间校核可接近）
+  - 病灶中心 `LESION_CENTER_REF = (0.09, -0.12, 0)`（相对原布局向工作空间微调，见 §4.3 可达性）
   - `HexahedronFEMForceField`（更软材料）
   - `BoxROI + FixedConstraint`（组织边界约束）
 
@@ -124,7 +124,8 @@ SOFA_EXPORT_INTERVAL=2  # 每 2 步导出一次；需要更少文件时可调大
 - 圆心：`lesion_center`
 - 半径：`circle_radius = 0.05 m`
 - 周期：`circle_period_steps = 240`
-- 工作空间检查：`python scripts/check_circle_workspace.py --radius 0.05`
+- 工作空间检查（6-DOF，`grid=25`）：`python scripts/check_circle_workspace.py --radius 0.05 --tolerance 0.01`
+- 可达性（当前布局）：`r=0.05 m` 时 72 相位采样 `max_error ≈ 3.5 mm`；`r ≤ 0.06 m` 仍可满足全点 `≤ 1 cm`
 
 `reward = -tracking - radial + progress - safety - over_contact + lap_bonus`
 

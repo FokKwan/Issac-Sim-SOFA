@@ -15,7 +15,7 @@ PCC_CURVATURE_DOF = 4
 PCC_INSERTION_INDEX = 4
 PCC_ROLL_INDEX = 5
 PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
-LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
+LESION_CENTER_REF = np.array([0.09, -0.12, 0.0], dtype=np.float64)
 TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
 TISSUE_GRID_MAX = np.array([0.25, -0.10, 0.06], dtype=np.float64)
 INSERTION_LIMIT = 0.08

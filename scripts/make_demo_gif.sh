@@ -15,7 +15,7 @@ MOTION_SCALE="${MOTION_SCALE:-1.0}"
 METRICS_CSV="${METRICS_CSV:-sofa/vtk_output/frame_metrics.csv}"
 ELEVATION="${ELEVATION:-20}"
 AZIMUTH="${AZIMUTH:-40}"
-LESION_CENTER="${LESION_CENTER:-0.08,-0.14,0.0}"
+LESION_CENTER="${LESION_CENTER:-0.09,-0.12,0.0}"
 TARGET_RADIUS="${TARGET_RADIUS:-0.05}"
 CIRCLE_PERIOD_STEPS="${CIRCLE_PERIOD_STEPS:-240}"
 VENV_PATH="${VENV_PATH:-.venv}"
@@ -46,7 +46,7 @@ Environment overrides:
   METRICS_CSV  Default: sofa/vtk_output/frame_metrics.csv
   ELEVATION    Default: 20
   AZIMUTH      Default: 40
-  LESION_CENTER Default: 0.08,-0.14,0.0
+  LESION_CENTER Default: 0.09,-0.12,0.0
   TARGET_RADIUS Default: 0.05
   CIRCLE_PERIOD_STEPS Default: 240 (must match issac_sim/envs/sofa_env.py)
   VENV_PATH    Default: .venv
@@ -232,7 +232,7 @@ tissue_files = sorted(glob.glob(tissue_glob))
 robot_by_id = index_by_frame_id(robot_files)
 tissue_by_id = index_by_frame_id(tissue_files)
 metrics_by_id = load_frame_metrics(metrics_csv)
-lesion_center = resolve_lesion_center(metrics_by_id, parse_vec3(os.environ["LESION_CENTER"], [0.08, -0.14, 0.0]))
+lesion_center = resolve_lesion_center(metrics_by_id, parse_vec3(os.environ["LESION_CENTER"], [0.09, -0.12, 0.0]))
 common_ids = sorted(set(robot_by_id) & set(tissue_by_id)) if tissue_by_id else sorted(robot_by_id)
 if not common_ids:
     raise SystemExit("[ERROR] No robot/tissue frame pairs with matching frame IDs.")

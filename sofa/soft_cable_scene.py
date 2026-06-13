@@ -45,7 +45,8 @@ PCC_BASE_OFFSET = np.array([-1.10, -0.08, 0.0], dtype=np.float64)
 # 初始机器人中心线为 y=-0.08，组织上表面 y=-0.10，保留 2 cm 间隙。
 TISSUE_GRID_MIN = np.array([-0.18, -0.22, -0.06], dtype=np.float64)
 TISSUE_GRID_MAX = np.array([0.25, -0.10, 0.06], dtype=np.float64)
-LESION_CENTER_REF = np.array([0.08, -0.14, 0.0], dtype=np.float64)
+# 病灶中心：相对原 (0.08,-0.14) 向 +X/+Y 微调，使 r=0.05 圆轨迹全点静态误差 ≤1 cm。
+LESION_CENTER_REF = np.array([0.09, -0.12, 0.0], dtype=np.float64)
 LESION_RADIUS = 0.025
 LESION_SURFACE_BAND = 0.006
 # 缆绳控制参数：每步曲率/插入增量（累积控制）。
