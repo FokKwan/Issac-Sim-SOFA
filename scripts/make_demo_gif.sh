@@ -359,7 +359,6 @@ lesion_center_marker = ax.scatter(
     linewidths=1.5,
     label="Lesion center",
 )
-ax.legend(loc="upper right")
 ax.view_init(elev=elevation, azim=azimuth)
 
 if motion_scale <= 0:
@@ -380,6 +379,37 @@ def scaled_points(points, rest_by_count):
     return rest + motion_scale * (points - rest)
 
 
+raw_tip_trajectory = np.array(
+    [points[-1].copy() for _, points in robot_point_clouds],
+    dtype=np.float64,
+)
+tip_trajectory = np.array(
+    [scaled_points(points, robot_rest_by_count)[-1].copy() for _, points in robot_point_clouds],
+    dtype=np.float64,
+)
+
+tip_path_line, = ax.plot(
+    [tip_trajectory[0, 0]],
+    [tip_trajectory[0, 1]],
+    [tip_trajectory[0, 2]],
+    color="#ff7f0e",
+    linewidth=2.5,
+    alpha=0.95,
+    label="Tip trajectory",
+)
+tip_current_marker = ax.scatter(
+    [tip_trajectory[0, 0]],
+    [tip_trajectory[0, 1]],
+    [tip_trajectory[0, 2]],
+    c="#ff7f0e",
+    marker="o",
+    s=max(24.0, point_size * 2.0),
+    alpha=0.95,
+    depthshade=False,
+)
+ax.legend(loc="upper right")
+
+
 def update(frame_idx):
     _path, robot_points = robot_point_clouds[frame_idx]
     render_robot_points = scaled_points(robot_points, robot_rest_by_count)
@@ -392,7 +422,15 @@ def update(frame_idx):
         render_robot_points[:, 1],
         render_robot_points[:, 2],
     )
-    artists = [robot_scatter, target_circle_line, lesion_center_marker]
+    artists = [robot_scatter, target_circle_line, lesion_center_marker, tip_path_line, tip_current_marker]
+
+    trail = tip_trajectory[: frame_idx + 1]
+    tip_path_line.set_data_3d(trail[:, 0], trail[:, 1], trail[:, 2])
+    tip_current_marker._offsets3d = (
+        np.array([trail[-1, 0]]),
+        np.array([trail[-1, 1]]),
+        np.array([trail[-1, 2]]),
+    )
 
     if tissue_scatter is not None and frame_idx < len(tissue_point_clouds):
         _, tissue_points = tissue_point_clouds[frame_idx]
@@ -444,4 +482,40 @@ print(
     f"min={min(tip_displacements):.6f}, max={max(tip_displacements):.6f}, "
     f"mean={float(np.mean(tip_displacements)):.6f}"
 )
+print("[INFO] Expected target circle (X-Z plane, meters):")
+print(
+    f"  center=({lesion_center[0]:.6f}, {lesion_center[1]:.6f}, {lesion_center[2]:.6f}), "
+    f"radius={target_radius:.6f}"
+)
+print(
+    "  formula: "
+    f"x = {lesion_center[0]:.6f} + {target_radius:.6f} * cos(phase), "
+    f"y = {lesion_center[1]:.6f}, "
+    f"z = {lesion_center[2]:.6f} + {target_radius:.6f} * sin(phase)"
+)
+for phase_name, phase in (
+    ("phase=0", 0.0),
+    ("phase=pi/2", 0.5 * np.pi),
+    ("phase=pi", np.pi),
+    ("phase=3pi/2", 1.5 * np.pi),
+):
+    point = np.array(
+        [
+            lesion_center[0] + target_radius * np.cos(phase),
+            lesion_center[1],
+            lesion_center[2] + target_radius * np.sin(phase),
+        ],
+        dtype=np.float64,
+    )
+    print(
+        f"  {phase_name}: "
+        f"({point[0]:.6f}, {point[1]:.6f}, {point[2]:.6f})"
+    )
+print("[INFO] Actual tip trajectory from rendered VTK frames (raw meters):")
+for frame_idx, (robot_path, _) in enumerate(robot_point_clouds):
+    step = frame_id(robot_path)
+    tip = raw_tip_trajectory[frame_idx]
+    print(
+        f"  frame={step:04d} tip=({tip[0]:.6f}, {tip[1]:.6f}, {tip[2]:.6f})"
+    )
 PY
